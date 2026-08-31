@@ -174,6 +174,32 @@ def create_handoff_summary(req: Request, args: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
+def request_human_handoff(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+    """记录 Agent 明确发起的人工介入请求，不创建真实工单。"""
+    return {
+        "success": True,
+        "request_id": req.request_id,
+        "reason": str(args.get("reason", "需要人工客服继续处理"))[:120],
+        "priority": str(args.get("priority", "normal"))[:20],
+        "ticket_created": False,
+    }
+
+
+def human_handoff_tools() -> Dict[str, AgentToolSpec]:
+    return {
+        "request_human_handoff": make_tool(
+            "request_human_handoff",
+            "仅在当前请求确实需要人工介入时发起交接申请；不会创建真实工单。",
+            {
+                "reason": {"type": "string", "description": "当前请求必须人工介入的具体原因"},
+                "priority": {"type": "string", "description": "normal、high 或 critical"},
+            },
+            request_human_handoff,
+            required=["reason"],
+        ),
+    }
+
+
 def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
     """构建所有 Agent 可共享的 RAG 工具。"""
 

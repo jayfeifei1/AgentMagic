@@ -1,28 +1,17 @@
-const DEFAULT_BACKENDS = {
-  python: {
-    id: 'python',
-    label: 'Python',
-    baseUrl: import.meta.env.VITE_PYTHON_API_URL || '/api/python',
-    port: '8000'
-  },
-  java: {
-    id: 'java',
-    label: 'Java',
-    baseUrl: import.meta.env.VITE_JAVA_API_URL || '/api/java',
-    port: '8080'
-  }
+const PYTHON_BACKEND = {
+  id: 'python',
+  label: 'Python',
+  baseUrl: import.meta.env.VITE_PYTHON_API_URL || '/api/python',
+  port: '8000'
 }
 
 export function createInitialSettings() {
   const saved = readSettings()
   return {
-    backend: saved.backend || import.meta.env.VITE_DEFAULT_BACKEND || 'python',
+    backend: 'python',
     userId: saved.userId || 'u1001',
     conversationId: saved.conversationId || '',
-    endpoints: {
-      python: saved.endpoints?.python || DEFAULT_BACKENDS.python.baseUrl,
-      java: saved.endpoints?.java || DEFAULT_BACKENDS.java.baseUrl
-    }
+    endpoints: { python: saved.endpoints?.python || PYTHON_BACKEND.baseUrl }
   }
 }
 
@@ -31,10 +20,10 @@ export function saveSettings(settings) {
 }
 
 export function backendMeta(type, settings) {
-  const meta = DEFAULT_BACKENDS[type] || DEFAULT_BACKENDS.java
+  const meta = PYTHON_BACKEND
   return {
     ...meta,
-    baseUrl: normalizeBaseUrl(settings.endpoints[type] || meta.baseUrl)
+    baseUrl: normalizeBaseUrl(settings.endpoints.python || meta.baseUrl)
   }
 }
 
@@ -147,7 +136,8 @@ function normalizeToolTraceResponse(raw) {
     trace: {
       ...trace,
       toolsUsed: trace.tools_used || trace.toolsUsed || [],
-      toolCalls: trace.tool_calls || trace.toolCalls || []
+      toolCalls: trace.tool_calls || trace.toolCalls || [],
+      llmCalls: trace.llm_calls || trace.llmCalls || []
     },
     raw
   }

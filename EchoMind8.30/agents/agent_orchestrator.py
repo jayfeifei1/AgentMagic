@@ -36,10 +36,12 @@ from agents.tools import (
     billing_tools,
     escalation_tools,
     general_tools,
+    human_handoff_tools,
     technical_tools,
 )
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_utils import extract_text_content
+from core.trace_time import trace_now
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +121,33 @@ class AgentResponse:
     escalate:    bool  = False   # 是否需要升级
     tools_used:  List[str] = field(default_factory=list)
     tool_traces: List[Dict[str, Any]] = field(default_factory=list)
+    llm_traces: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class AgentExecution:
+    """单次 Agent 调用的请求级状态，不能保存在可复用 Agent 实例上。"""
+    content: str
+    tools_used: List[str] = field(default_factory=list)
+    tool_traces: List[Dict[str, Any]] = field(default_factory=list)
+    llm_traces: List[Dict[str, Any]] = field(default_factory=list)
+    escalate: bool = False
+
+
+class AgentExecutionError(RuntimeError):
+    """保留失败调用已经产生的 Trace，供降级与持久化使用。"""
+
+    def __init__(
+        self,
+        message: str,
+        tools_used: List[str],
+        tool_traces: List[Dict[str, Any]],
+        llm_traces: List[Dict[str, Any]],
+    ):
+        super().__init__(message)
+        self.tools_used = tools_used
+        self.tool_traces = tool_traces
+        self.llm_traces = llm_traces
 
 
 @dataclass
@@ -151,6 +180,8 @@ class OrchestratorResult:
     tool_traces: List[Dict[str, Any]] = field(default_factory=list)
     routing_reason: str = ""
     routing_confidence: float = 0.0
+    success: bool = True
+    llm_traces: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -191,8 +222,6 @@ class BaseAgent:
         self._model  = self.profile.model or model
         self._skill_manager = skill_manager
         self.stats   = AgentStats()
-        self._last_tools_used: List[str] = []
-        self._last_tool_traces: List[Dict[str, Any]] = []
         self._shared_tools: Dict[str, AgentToolSpec] = {}
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
@@ -205,22 +234,33 @@ class BaseAgent:
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
-        self._last_tools_used = []
-        self._last_tool_traces = []
         try:
-            content = await self._call_llm(req)
+            execution = await self._call_llm(req)
             ms = (time.monotonic() - t0) * 1000
             self.stats.success += 1
             self.stats.total_ms += ms
-            escalate = self._needs_escalation(content)
             return AgentResponse(
                 agent_type=self.agent_type,
-                content=content,
+                content=execution.content,
                 success=True,
                 latency_ms=ms,
-                escalate=escalate,
-                tools_used=list(self._last_tools_used),
-                tool_traces=list(self._last_tool_traces),
+                escalate=execution.escalate,
+                tools_used=execution.tools_used,
+                tool_traces=execution.tool_traces,
+                llm_traces=execution.llm_traces,
+            )
+        except AgentExecutionError as ex:
+            ms = (time.monotonic() - t0) * 1000
+            self.stats.total_ms += ms
+            logger.error(f"{self.agent_type.value} 处理失败: {ex}")
+            return AgentResponse(
+                agent_type=self.agent_type,
+                content="抱歉，处理您的请求时出现问题，请稍后重试。",
+                success=False,
+                latency_ms=ms,
+                tools_used=ex.tools_used,
+                tool_traces=ex.tool_traces,
+                llm_traces=ex.llm_traces,
             )
         except Exception as ex:
             ms = (time.monotonic() - t0) * 1000
@@ -231,10 +271,9 @@ class BaseAgent:
                 content="抱歉，处理您的请求时出现问题，请稍后重试。",
                 success=False,
                 latency_ms=ms,
-                tool_traces=list(self._last_tool_traces),
             )
 
-    async def _call_llm(self, req: Request) -> str:
+    async def _call_llm(self, req: Request) -> AgentExecution:
         def _clean(s: str) -> str:
             return s.encode("utf-8", errors="ignore").decode("utf-8")
 
@@ -255,7 +294,9 @@ class BaseAgent:
         tools = self.get_tools()
         tools_used: List[str] = []
         tool_traces: List[Dict[str, Any]] = []
-        for _ in range(3):
+        llm_traces: List[Dict[str, Any]] = []
+        escalate = False
+        for round_no in range(1, 4):
             request_kwargs: Dict[str, Any] = {
                 "model": self._model,
                 "max_tokens": self.profile.max_tokens,
@@ -272,11 +313,41 @@ class BaseAgent:
                     }
                     for spec in tools.values()
                 ]
-            resp = await self._client.messages.create(**request_kwargs)
+            llm_t0 = time.monotonic()
+            llm_timestamp = trace_now().isoformat()
+            try:
+                resp = await self._client.messages.create(**request_kwargs)
+            except Exception as ex:
+                llm_traces.append({
+                    "agent_type": self.agent_type.value,
+                    "round_no": round_no,
+                    "model": self._model,
+                    "status": "failed",
+                    "latency_ms": round((time.monotonic() - llm_t0) * 1000, 1),
+                    "error_type": type(ex).__name__,
+                    "error": str(ex),
+                    "timestamp": llm_timestamp,
+                })
+                raise AgentExecutionError(str(ex), tools_used, tool_traces, llm_traces) from ex
+            llm_traces.append({
+                "agent_type": self.agent_type.value,
+                "round_no": round_no,
+                "model": self._model,
+                "status": "success",
+                "latency_ms": round((time.monotonic() - llm_t0) * 1000, 1),
+                "error_type": None,
+                "error": "",
+                "timestamp": llm_timestamp,
+            })
             tool_uses = [block for block in (resp.content or []) if self._block_type(block) == "tool_use"]
             if not tool_uses:
-                self._last_tools_used = tools_used
-                return extract_text_content(resp.content)
+                return AgentExecution(
+                    content=extract_text_content(resp.content),
+                    tools_used=tools_used,
+                    tool_traces=tool_traces,
+                    llm_traces=llm_traces,
+                    escalate=escalate,
+                )
 
             messages.append({"role": "assistant", "content": resp.content})
             tool_results = []
@@ -302,6 +373,8 @@ class BaseAgent:
                         tools_used.append(name)
                         if isinstance(result, dict) and "success" in result:
                             result_success = bool(result.get("success"))
+                        if name == "request_human_handoff" and result_success is True:
+                            escalate = True
                     except Exception as ex:
                         call_success = False
                         logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
@@ -315,13 +388,15 @@ class BaseAgent:
                         "agent_type": self.agent_type.value,
                         "tool_name": name,
                         "tool_use_id": tool_use_id,
-                        "input": dict(args),
+                        "input": dict(args) if isinstance(args, dict) else {},
+                        "result_summary": self._trace_result_summary(result),
                         "success": call_success,
                         "result_success": result_success,
                         "latency_ms": round(tool_latency_ms, 1),
                         "cached": bool(result.get("cached")) if isinstance(result, dict) else False,
                         "reranked": bool(result.get("reranked")) if isinstance(result, dict) else False,
                         "error": error_text,
+                        "timestamp": trace_now().isoformat(),
                     }
                 )
                 tool_results.append({
@@ -331,9 +406,18 @@ class BaseAgent:
                 })
             messages.append({"role": "user", "content": tool_results})
 
-        self._last_tools_used = tools_used
-        self._last_tool_traces = tool_traces
-        raise RuntimeError(f"{self.agent_type.value} 工具调用超过最大轮数")
+        raise AgentExecutionError(
+            f"{self.agent_type.value} 工具调用超过最大轮数",
+            tools_used,
+            tool_traces,
+            llm_traces,
+        )
+
+    @staticmethod
+    def _trace_result_summary(result: Any) -> str:
+        """工具结果只保留有限摘要，防止单条 Trace 无限膨胀。"""
+        text = json.dumps(result, ensure_ascii=False, default=str)
+        return text if len(text) <= 2000 else f"{text[:1997]}..."
 
     @staticmethod
     def _block_type(block: Any) -> Optional[str]:
@@ -398,12 +482,6 @@ class BaseAgent:
         }
         return json.dumps(packet, ensure_ascii=False)
 
-    def _needs_escalation(self, content: str) -> bool:
-        """检测 Agent 是否建议升级（简单关键词检测）。"""
-        keywords = ["转人工", "人工客服", "escalate", "specialist", "无法处理"]
-        return any(kw in content for kw in keywords)
-
-
 class GeneralAgent(BaseAgent):
     agent_type    = AgentType.GENERAL
     profile = AgentProfile(
@@ -413,13 +491,13 @@ class GeneralAgent(BaseAgent):
         input_contract=("对话历史", "用户画像", "意图与紧急度", "知识库上下文"),
         output_contract=("先回应核心问题", "信息不足时只询问必要字段", "明确下一步和边界"),
         handoff_conditions=("涉及权限、资金、隐私或复杂投诉", "用户明确要求人工"),
-        tool_scope=("search_knowledge_base", "inspect_request_context", "suggest_required_fields"),
+        tool_scope=("search_knowledge_base", "inspect_request_context", "suggest_required_fields", "request_human_handoff"),
         temperature=0.3,
         max_tokens=900,
     )
     system_prompt = (
         "你是 EchoMind 智能客服。友好、简洁地回答用户问题。"
-        "如果问题超出你的能力范围，明确说明并建议转接专业客服。"
+        "只有当前请求确实需要人工介入时才调用 request_human_handoff；仅说明升级条件时不要调用。"
     )
 
     def _build_role_packet(self, req: Request) -> str:
@@ -431,6 +509,7 @@ class GeneralAgent(BaseAgent):
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         tools = super().get_tools()
         tools.update(general_tools())
+        tools.update(human_handoff_tools())
         return tools
 
 
@@ -443,13 +522,13 @@ class TechnicalAgent(BaseAgent):
         input_contract=("错误码", "问题发生时间", "运行环境", "影响范围", "最近变更", "知识库上下文"),
         output_contract=("现象复述", "可能原因", "编号排查步骤", "验证结果", "需要补充的信息"),
         handoff_conditions=("生产大面积不可用", "数据丢失或权限异常", "需要后台日志、数据库或人工操作"),
-        tool_scope=("search_knowledge_base", "lookup_error_code", "build_diagnostic_plan"),
+        tool_scope=("search_knowledge_base", "lookup_error_code", "build_diagnostic_plan", "request_human_handoff"),
         temperature=0.1,
         max_tokens=1200,
     )
     system_prompt = (
         "你是技术支持专家。专注于：故障排查、错误诊断、系统配置。"
-        "提供清晰的步骤化解决方案。遇到需要后台操作的问题，说明需要升级处理。"
+        "提供清晰的步骤化解决方案。只有当前请求确实需要人工介入时才调用 request_human_handoff；仅说明升级条件时不要调用。"
     )
 
     def _build_role_packet(self, req: Request) -> str:
@@ -464,6 +543,7 @@ class TechnicalAgent(BaseAgent):
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         tools = super().get_tools()
         tools.update(technical_tools())
+        tools.update(human_handoff_tools())
         return tools
 
 
@@ -476,13 +556,13 @@ class BillingAgent(BaseAgent):
         input_contract=("订单号", "金额与币种", "支付时间", "支付渠道", "用户期望", "知识库上下文"),
         output_contract=("需要核验的信息", "当前可判断内容", "下一步处理路径", "时效边界"),
         handoff_conditions=("实际退款或补偿", "重复扣款或支付成功但订单未生效", "发票作废/重开", "企业合同或大额订单"),
-        tool_scope=("search_knowledge_base", "check_billing_fields", "compare_amounts"),
+        tool_scope=("search_knowledge_base", "check_billing_fields", "compare_amounts", "request_human_handoff"),
         temperature=0.0,
         max_tokens=1100,
     )
     system_prompt = (
         "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
-        "对财务问题保持准确和专业。涉及实际退款操作时，说明需要人工审核。"
+        "对财务问题保持准确和专业。只有当前请求确实需要人工介入时才调用 request_human_handoff；仅说明升级条件时不要调用。"
     )
 
     def _build_role_packet(self, req: Request) -> str:
@@ -504,6 +584,7 @@ class BillingAgent(BaseAgent):
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         tools = super().get_tools()
         tools.update(billing_tools())
+        tools.update(human_handoff_tools())
         return tools
 
 
@@ -566,12 +647,12 @@ class ResponseComposer:
         self._model = model
         self._skill_manager = skill_manager
 
-    async def compose(self, req: Request, responses: List[AgentResponse]) -> str:
+    async def compose(self, req: Request, responses: List[AgentResponse]) -> AgentExecution:
         successful = [response for response in responses if response.success and response.content.strip()]
         if not successful:
-            return "抱歉，所有 Agent 均处理失败。"
+            return AgentExecution(content="抱歉，所有 Agent 均处理失败。")
         if len(successful) == 1:
-            return successful[0].content
+            return AgentExecution(content=successful[0].content)
 
         evidence = "\n\n".join(
             f"[{response.agent_type.value} Agent 输出]\n{response.content}"
@@ -590,6 +671,9 @@ class ResponseComposer:
             skill = self._skill_manager.prompt_for(req.message, "general")
             if skill:
                 prompt += f"\n\n[通用客服输出边界]\n{skill}"
+        llm_t0 = time.monotonic()
+        llm_timestamp = trace_now().isoformat()
+        llm_traces: List[Dict[str, Any]] = []
         try:
             response = await self._client.messages.create(
                 model=self._model,
@@ -598,15 +682,38 @@ class ResponseComposer:
                 messages=[{"role": "user", "content": prompt}],
             )
             content = extract_text_content(response.content).strip()
+            llm_traces.append({
+                "agent_type": "composer",
+                "round_no": 1,
+                "model": self._model,
+                "status": "success",
+                "latency_ms": round((time.monotonic() - llm_t0) * 1000, 1),
+                "error_type": None,
+                "error": "",
+                "timestamp": llm_timestamp,
+            })
             if content:
-                return content
+                return AgentExecution(content=content, llm_traces=llm_traces)
         except Exception as ex:
             logger.warning("Response Composer 失败，使用确定性合并: %s", ex)
+            llm_traces.append({
+                "agent_type": "composer",
+                "round_no": 1,
+                "model": self._model,
+                "status": "failed",
+                "latency_ms": round((time.monotonic() - llm_t0) * 1000, 1),
+                "error_type": type(ex).__name__,
+                "error": str(ex),
+                "timestamp": llm_timestamp,
+            })
 
         # 汇总节点不可用时保留主次标签，避免丢失某个专业 Agent 的结论。
-        return "\n\n".join(
-            f"{response.content}" if index == 0 else f"补充说明：\n{response.content}"
-            for index, response in enumerate(successful)
+        return AgentExecution(
+            content="\n\n".join(
+                f"{response.content}" if index == 0 else f"补充说明：\n{response.content}"
+                for index, response in enumerate(successful)
+            ),
+            llm_traces=llm_traces,
         )
 
 
@@ -645,6 +752,7 @@ class AgentOrchestrator:
         model:    str = "claude-3-5-sonnet-20241022",
         skill_manager: Optional[Any] = None,
         rag_tool_manager: Optional[Any] = None,
+        trace_repository: Optional[Any] = None,
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -656,6 +764,7 @@ class AgentOrchestrator:
         self._composer = ResponseComposer(client, model, skill_manager)
         self._shared_tools: Dict[str, AgentToolSpec] = {}
         self._recent_tool_traces = deque(maxlen=_env_int("ECHOMIND_TOOL_TRACE_MAX", 200))
+        self._trace_repository = trace_repository
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
@@ -706,19 +815,25 @@ class AgentOrchestrator:
         """对外暴露意图识别，供 API 层先判断是否需要 RAG 等前置能力。"""
         return await self._intent_recognizer.recognize(message, history=history)
 
-    def _record_tool_trace(self, result: OrchestratorResult) -> None:
+    async def _record_tool_trace(self, result: OrchestratorResult) -> None:
         trace = {
             "request_id": result.request_id,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": trace_now().isoformat(),
             "intent": result.intent.value if result.intent else None,
             "primary_agent": result.primary_agent.value if result.primary_agent else None,
             "supporting_agents": [agent.value for agent in result.supporting_agents],
             "tools_used": list(result.tools_used),
             "tool_calls": list(result.tool_traces),
+            "llm_calls": list(result.llm_traces),
             "escalated": result.escalated,
             "latency_ms": round(result.latency_ms, 1),
+            "status": "success" if result.success else "failed",
+            "routing_reason": result.routing_reason,
+            "routing_confidence": round(result.routing_confidence, 4),
         }
         self._recent_tool_traces.append(trace)
+        if self._trace_repository is not None:
+            await self._trace_repository.persist(trace)
 
     def get_tool_trace(self, request_id: str) -> Optional[Dict[str, Any]]:
         for trace in reversed(self._recent_tool_traces):
@@ -762,7 +877,7 @@ class AgentOrchestrator:
                 routing_reason="低置信度 OTHER 意图，先澄清用户需求",
                 routing_confidence=req.intent_confidence,
             )
-            self._record_tool_trace(result)
+            await self._record_tool_trace(result)
             return result
 
         # 复杂问题自动并行协作，例如同一句同时涉及登录故障和扣款/退款。
@@ -797,8 +912,10 @@ class AgentOrchestrator:
             tool_traces=list(response.tool_traces),
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
+            success=response.success,
+            llm_traces=list(response.llm_traces),
         )
-        self._record_tool_trace(result)
+        await self._record_tool_trace(result)
         return result
 
     async def run_parallel(self, req: Request, decision: RoutingDecision) -> OrchestratorResult:
@@ -812,7 +929,8 @@ class AgentOrchestrator:
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
         valid_responses = [r for r in responses if isinstance(r, AgentResponse)]
-        combined = await self._composer.compose(req, valid_responses)
+        composition = await self._composer.compose(req, valid_responses)
+        combined = composition.content
         escalated = any(isinstance(r, AgentResponse) and r.escalate for r in responses)
         tools_used = list(dict.fromkeys(
             tool_name
@@ -824,6 +942,11 @@ class AgentOrchestrator:
             for response in valid_responses
             for trace in response.tool_traces
         ]
+        llm_traces = [
+            trace
+            for response in valid_responses
+            for trace in response.llm_traces
+        ] + composition.llm_traces
         result = OrchestratorResult(
             request_id=req.request_id,
             response=combined,
@@ -841,8 +964,10 @@ class AgentOrchestrator:
             tool_traces=tool_traces,
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
+            success=any(response.success for response in valid_responses),
+            llm_traces=llm_traces,
         )
-        self._record_tool_trace(result)
+        await self._record_tool_trace(result)
         return result
 
     # ── 路由逻辑 ──────────────────────────────────────────────────────────────
@@ -1065,7 +1190,13 @@ class AgentOrchestrator:
             logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
             fallback = self._best_agent(AgentType.GENERAL)
             if fallback:
+                failed_response = response
                 response = await fallback.handle(req)
+                response.tools_used = list(dict.fromkeys(
+                    failed_response.tools_used + response.tools_used
+                ))
+                response.tool_traces = failed_response.tool_traces + response.tool_traces
+                response.llm_traces = failed_response.llm_traces + response.llm_traces
 
         return response
 

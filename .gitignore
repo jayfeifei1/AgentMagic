@@ -3,3 +3,6 @@
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Workspace-local database credentials
+EchoMind8.30/mysql.env

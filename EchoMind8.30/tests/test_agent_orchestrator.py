@@ -3,10 +3,12 @@ import asyncio
 from agents.agent_orchestrator import (
     AgentProfile,
     AgentResponse,
+    AgentOrchestrator,
     AgentType,
     BillingAgent,
     EscalationAgent,
     GeneralAgent,
+    OrchestratorResult,
     Request,
     ResponseComposer,
     RoutingDecision,
@@ -92,11 +94,36 @@ def test_composer_fallback_preserves_primary_and_supporting_results():
         AgentResponse(AgentType.BILLING, "请提供两笔扣款的时间和金额。", True),
     ]
 
-    content = asyncio.run(composer.compose(req, responses))
+    composition = asyncio.run(composer.compose(req, responses))
+    content = composition.content
 
     assert content.startswith("先排查 Token 是否过期。")
     assert "补充说明" in content
     assert "两笔扣款" in content
+    assert composition.llm_traces[0]["agent_type"] == "composer"
+    assert composition.llm_traces[0]["status"] == "failed"
+
+
+def test_composer_records_successful_llm_call():
+    class TextBlock:
+        type = "text"
+        text = "已合并技术与账单处理建议。"
+
+    composer = ResponseComposer(
+        FakeClient(response=type("Response", (), {"content": [TextBlock()]})()),
+        "test-model",
+    )
+    result = asyncio.run(composer.compose(
+        make_request(),
+        [
+            AgentResponse(AgentType.TECHNICAL, "技术建议", True),
+            AgentResponse(AgentType.BILLING, "账单建议", True),
+        ],
+    ))
+
+    assert result.content == "已合并技术与账单处理建议。"
+    assert result.llm_traces[0]["agent_type"] == "composer"
+    assert result.llm_traces[0]["status"] == "success"
 
 
 def test_routing_decision_can_target_escalation_pool():
@@ -116,12 +143,12 @@ def test_agent_tool_scopes_are_real_and_isolated():
     billing_tools = set(BillingAgent(FakeClient(), "test-model").get_tools())
     escalation_tools = set(EscalationAgent(FakeClient(), "test-model").get_tools())
 
-    assert general_tools == {"inspect_request_context", "suggest_required_fields"}
-    assert technical_tools == {"lookup_error_code", "build_diagnostic_plan"}
-    assert billing_tools == {"check_billing_fields", "compare_amounts"}
+    assert general_tools == {"inspect_request_context", "suggest_required_fields", "request_human_handoff"}
+    assert technical_tools == {"lookup_error_code", "build_diagnostic_plan", "request_human_handoff"}
+    assert billing_tools == {"check_billing_fields", "compare_amounts", "request_human_handoff"}
     assert escalation_tools == {"create_handoff_summary"}
-    assert not general_tools & technical_tools
-    assert not technical_tools & billing_tools
+    assert general_tools & technical_tools == {"request_human_handoff"}
+    assert technical_tools & billing_tools == {"request_human_handoff"}
 
 
 def test_shared_rag_tool_is_available_to_all_agents():
@@ -195,9 +222,142 @@ def test_tool_use_round_trip_executes_only_whitelisted_tool():
 
     assert response.success is True
     assert response.tools_used == ["lookup_error_code"]
+    assert len(response.tool_traces) == 1
+    assert response.tool_traces[0]["tool_name"] == "lookup_error_code"
+    assert response.tool_traces[0]["input"] == {"error_code": "401"}
+    assert response.tool_traces[0]["success"] is True
+    assert [item["round_no"] for item in response.llm_traces] == [1, 2]
+    assert all(item["model"] == "test-model" for item in response.llm_traces)
+    assert all(item["status"] == "success" for item in response.llm_traces)
     assert len(client.calls) == 2
     assert {tool["name"] for tool in client.calls[0]["tools"]} == {
         "lookup_error_code",
         "build_diagnostic_plan",
+        "request_human_handoff",
     }
     assert "tool_result" in str(client.calls[1]["messages"])
+
+
+def test_textual_handoff_hint_does_not_mark_response_escalated():
+    class TextBlock:
+        type = "text"
+        text = "请先检查 Token；若仍无法解决，可以建议转人工继续排查。"
+
+    agent = TechnicalAgent(
+        FakeClient(response=type("Response", (), {"content": [TextBlock()]})()),
+        "test-model",
+    )
+
+    response = asyncio.run(agent.handle(make_request(message="登录提示 401，请给出排查步骤。")))
+
+    assert response.success is True
+    assert response.escalate is False
+
+
+def test_handoff_function_call_marks_response_escalated_and_records_trace():
+    class ToolUseBlock:
+        type = "tool_use"
+        id = "toolu_handoff"
+        name = "request_human_handoff"
+        input = {"reason": "需要后台日志进一步核验", "priority": "high"}
+
+    class TextBlock:
+        type = "text"
+        text = "已记录人工介入申请，请等待后续处理。"
+
+    class ToolClient:
+        def __init__(self):
+            self.responses = [
+                type("Response", (), {"content": [ToolUseBlock()]})(),
+                type("Response", (), {"content": [TextBlock()]})(),
+            ]
+
+        class Messages:
+            def __init__(self, owner):
+                self.owner = owner
+
+            async def create(self, **kwargs):
+                return self.owner.responses.pop(0)
+
+        @property
+        def messages(self):
+            return self.Messages(self)
+
+    response = asyncio.run(TechnicalAgent(ToolClient(), "test-model").handle(make_request()))
+
+    assert response.success is True
+    assert response.escalate is True
+    assert response.tools_used == ["request_human_handoff"]
+    assert response.tool_traces[0]["tool_name"] == "request_human_handoff"
+    assert response.tool_traces[0]["input"]["reason"] == "需要后台日志进一步核验"
+
+
+def test_concurrent_requests_keep_agent_traces_isolated():
+    class ToolUseBlock:
+        type = "tool_use"
+
+        def __init__(self, marker):
+            self.id = f"toolu_{marker}"
+            self.name = "lookup_error_code"
+            self.input = {"error_code": marker}
+
+    class TextBlock:
+        type = "text"
+
+        def __init__(self, marker):
+            self.text = f"{marker} 的排查建议"
+
+    class ConcurrentClient:
+        class Messages:
+            async def create(inner, **kwargs):
+                await asyncio.sleep(0)
+                payload = str(kwargs["messages"])
+                marker = "401" if "401" in payload else "500"
+                if "tool_result" in payload:
+                    return type("Response", (), {"content": [TextBlock(marker)]})()
+                return type("Response", (), {"content": [ToolUseBlock(marker)]})()
+
+        messages = Messages()
+
+    async def run_both():
+        agent = TechnicalAgent(ConcurrentClient(), "test-model")
+        return await asyncio.gather(
+            agent.handle(make_request(message="登录报 401", entities={"error_code": ["401"]})),
+            agent.handle(make_request(message="服务报 500", entities={"error_code": ["500"]})),
+        )
+
+    first, second = asyncio.run(run_both())
+    assert first.tool_traces[0]["input"] == {"error_code": "401"}
+    assert second.tool_traces[0]["input"] == {"error_code": "500"}
+    assert len(first.llm_traces) == len(second.llm_traces) == 2
+
+
+def test_orchestrator_persists_complete_trace_through_repository():
+    class RecordingRepository:
+        def __init__(self):
+            self.traces = []
+
+        async def persist(self, trace):
+            self.traces.append(trace)
+            return True
+
+    repository = RecordingRepository()
+    orchestrator = AgentOrchestrator(api_key="test-key", model="test-model", trace_repository=repository)
+    result = OrchestratorResult(
+        request_id="trace-unit-check",
+        response="已完成排查。",
+        agent_type=AgentType.TECHNICAL,
+        intent=IntentCategory.TECHNICAL_LOGIN,
+        primary_agent=AgentType.TECHNICAL,
+        tools_used=["lookup_error_code"],
+        tool_traces=[{"tool_name": "lookup_error_code"}],
+        llm_traces=[{"agent_type": "technical", "round_no": 1, "model": "test-model"}],
+        routing_reason="unit test",
+        routing_confidence=0.9,
+    )
+
+    asyncio.run(orchestrator._record_tool_trace(result))
+
+    assert repository.traces[0]["request_id"] == "trace-unit-check"
+    assert repository.traces[0]["tool_calls"][0]["tool_name"] == "lookup_error_code"
+    assert repository.traces[0]["llm_calls"][0]["round_no"] == 1

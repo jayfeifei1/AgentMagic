@@ -43,6 +43,27 @@ services:
       retries: 3
       start_period: 10s
 
+  # ── MySQL（Trace 与业务模拟数据的持久化存储）───────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: echomind-mysql
+    ports:
+      - "3306:3306"
+    env_file:
+      - ./mysql.env
+    command: --default-time-zone=+08:00 --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+    restart: unless-stopped
+    networks:
+      - echomind-network
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$$MYSQL_USER -p$$MYSQL_PASSWORD || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
   # ── Prometheus 监控 ─────────────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:latest
@@ -78,12 +99,16 @@ services:
       - "8000:8000"
     env_file:
       - .env
+      - mysql.env
     environment:
       # 容器内固定值，覆盖 .env 中的本地路径
       - REDIS_URL=redis://:${REDIS_PASSWORD:-echomind123}@redis:6379/0
       - CHROMA_PERSIST_DIRECTORY=/app/data/chroma
       - EVAL_BASELINE_PATH=/app/data/eval/baseline.json
       - ECHOMIND_SKILLS_DIR=/app/skills
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - ECHOMIND_TRACE_UTC_OFFSET_HOURS=8
     volumes:
       - ./data/chroma:/app/data/chroma
       - ./data/eval:/app/data/eval
@@ -93,6 +118,8 @@ services:
       redis:
         condition: service_healthy
       chromadb:
+        condition: service_healthy
+      mysql:
         condition: service_healthy
     restart: unless-stopped
     networks:
@@ -120,7 +147,7 @@ services:
     networks:
       - echomind-network
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost/health || exit 1"]
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -138,5 +165,6 @@ networks:
 volumes:
   redis-data:
   chromadb-data:
+  mysql-data:
   prometheus-data:
   nginx-logs:

@@ -56,8 +56,13 @@
               <p>{{ item.content }}</p>
               <div v-if="item.trace" class="message-trace">
                 <div class="trace-head">
-                  <span>工具调用</span>
+                  <span>执行 Trace</span>
                   <small v-if="item.trace.requestId">#{{ item.trace.requestId }}</small>
+                </div>
+                <div class="trace-summary">
+                  <span>LLM {{ item.trace.llmCalls?.length || 0 }} 次</span>
+                  <span>工具 {{ item.trace.toolCalls?.length || 0 }} 次</span>
+                  <span>{{ traceStatusLabel(item.trace.status) }}</span>
                 </div>
                 <div v-if="item.trace.toolCalls?.length" class="trace-calls">
                   <details v-for="(call, index) in item.trace.toolCalls" :key="`${item.id}-${index}`" open>
@@ -72,6 +77,17 @@
                   <p>本次请求已生成 trace，但没有可展示的工具输入。</p>
                   <p v-if="item.trace.toolsUsed?.length" class="trace-note">已调用：{{ item.trace.toolsUsed.join(' · ') }}</p>
                 </div>
+              </div>
+            </article>
+
+            <article v-if="chatPending" class="message assistant pending-message" role="status" aria-live="polite">
+              <div class="message-meta">
+                <span>{{ currentBackend.label }} Agent</span>
+                <small>处理中</small>
+              </div>
+              <div class="pending-content">
+                <span class="pending-spinner" aria-hidden="true"></span>
+                <span>正在分析问题并生成回复…</span>
               </div>
             </article>
 
@@ -133,11 +149,6 @@
                 <span class="status-copy" :class="healthOk ? 'success' : 'muted'">{{ healthLabel }}</span>
               </div>
 
-              <div class="backend-tabs">
-                <button :class="{ active: settings.backend === 'java' }" @click="switchBackend('java')">Java</button>
-                <button :class="{ active: settings.backend === 'python' }" @click="switchBackend('python')">Python</button>
-              </div>
-
               <label>
                 <span>用户 ID</span>
                 <input v-model="settings.userId" @change="persist" placeholder="u1001" />
@@ -175,6 +186,23 @@
                 </dl>
                 <p v-if="lastResponse.routingReason" class="routing-reason">{{ lastResponse.routingReason }}</p>
                 <div v-if="lastTrace?.trace" class="trace-call-list">
+                  <div class="trace-call-title">LLM 调用</div>
+                  <div v-if="lastTrace.trace.llmCalls?.length" class="llm-call-list">
+                    <div v-for="(call, index) in lastTrace.trace.llmCalls" :key="`${call.agent_type || 'agent'}-${call.round_no || index}`" class="llm-call-item">
+                      <div class="trace-call-meta">
+                        <strong>{{ llmAgentLabel(call.agent_type) }} · 第 {{ call.round_no || 1 }} 轮</strong>
+                        <span :class="call.status === 'success' ? 'success' : 'danger'">{{ traceStatusLabel(call.status) }}</span>
+                      </div>
+                      <div class="llm-call-details">
+                        <code>{{ call.model || '-' }}</code>
+                        <span>{{ formatLatency(call.latency_ms) }}</span>
+                      </div>
+                      <p v-if="call.error" class="trace-error">{{ call.error }}</p>
+                    </div>
+                  </div>
+                  <div v-else class="trace-empty-block">
+                    <p>本次请求未触发 LLM 调用。</p>
+                  </div>
                   <div class="trace-call-title">工具调用</div>
                   <div v-for="(call, index) in lastTrace.trace.toolCalls" :key="`${call.tool_use_id || index}`" class="trace-call-item">
                     <div class="trace-call-meta">
@@ -328,11 +356,15 @@ import {
   uploadKnowledge
 } from './lib/backends'
 
+const CONVERSATION_STORAGE_KEY = 'echomind.frontend.conversation'
+
 const settings = reactive(createInitialSettings())
+const restoredConversation = readConversation()
 const activeView = ref('chat')
-const messages = ref([])
+const messages = ref(restoredConversation.messages)
 const draft = ref('')
 const busy = ref(false)
+const chatPending = ref(false)
 const healthOk = ref(false)
 const healthLabel = ref('未检查')
 const statusText = ref('')
@@ -345,12 +377,12 @@ const messageList = ref(null)
 const sidebarRef = ref(null)
 const monitorData = ref({ agent_stats: {}, tool_stats: {}, active_alerts: [], suggestions: [] })
 const skillsData = ref({ count: 0, skills: [], errors: [] })
-const lastResponse = ref(null)
-const lastTrace = ref(null)
+const lastResponse = ref(restoredConversation.lastResponse)
+const lastTrace = ref(restoredConversation.lastTrace)
 const evalData = ref(null)
 const toast = ref('')
 let toastTimer
-let messageSequence = 0
+let messageSequence = messages.value.length
 let sidebarObserver
 
 const currentBackend = computed(() => backendMeta(settings.backend, settings))
@@ -361,6 +393,7 @@ const agentCount = computed(() => Object.keys(monitorData.value.agent_stats || {
 const totalRequests = computed(() => Object.values(monitorData.value.agent_stats || {}).reduce((sum, item) => sum + Number(item.total || 0), 0))
 
 watch(() => settings.conversationId, persist)
+watch([messages, lastResponse, lastTrace], persistConversation, { deep: true })
 onMounted(() => {
   refreshConsole()
   updateSidebarHeight()
@@ -378,24 +411,40 @@ onBeforeUnmount(() => {
 
 function persist() { saveSettings(settings) }
 
+function readConversation() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(CONVERSATION_STORAGE_KEY) || '{}')
+    const messages = Array.isArray(stored.messages)
+      ? stored.messages.filter((item) => item && ['user', 'assistant'].includes(item.role) && typeof item.content === 'string')
+      : []
+    return {
+      messages,
+      lastResponse: stored.lastResponse || null,
+      lastTrace: stored.lastTrace || null
+    }
+  } catch {
+    return { messages: [], lastResponse: null, lastTrace: null }
+  }
+}
+
+function persistConversation() {
+  try {
+    localStorage.setItem(CONVERSATION_STORAGE_KEY, JSON.stringify({
+      messages: messages.value.slice(-50),
+      lastResponse: lastResponse.value,
+      lastTrace: lastTrace.value
+    }))
+  } catch {
+    // 浏览器存储空间不足时，保留当前页面中的会话，不影响继续聊天。
+  }
+}
+
 function updateSidebarHeight() {
   const sidebar = sidebarRef.value
   if (!sidebar) return
   const rect = sidebar.getBoundingClientRect()
   const height = Math.max(320, Math.floor(rect.height))
   sidebar.style.setProperty('--sidebar-height', `${height}px`)
-}
-
-function switchBackend(type) {
-  settings.backend = type
-  persist()
-  healthOk.value = false
-  healthLabel.value = '未检查'
-  messages.value = []
-  searchResults.value = []
-  lastResponse.value = null
-  lastTrace.value = null
-  refreshConsole()
 }
 
 async function refreshConsole() {
@@ -412,24 +461,6 @@ async function checkHealth() {
     healthOk.value = false
     healthLabel.value = '不可用'
     statusText.value = error.message
-
-    // When the saved backend is stale, try the other configured service once.
-    const fallback = settings.backend === 'python' ? 'java' : 'python'
-    if (settings.backend !== fallback) {
-      try {
-        const fallbackData = await requestHealth(fallback, settings)
-        if (fallbackData.status === 'ok') {
-          settings.backend = fallback
-          persist()
-          healthOk.value = true
-          healthLabel.value = fallbackData.status
-          statusText.value = JSON.stringify(fallbackData, null, 2)
-          await Promise.allSettled([loadStats(), loadMonitor(), loadSkills()])
-        }
-      } catch {
-        // Keep the original error visible when both services are unavailable.
-      }
-    }
   }
 }
 
@@ -475,6 +506,9 @@ async function sendMessage() {
   messages.value.push({ id: createMessageId(), role: 'user', content })
   draft.value = ''
   busy.value = true
+  chatPending.value = true
+  await nextTick()
+  messageList.value?.scrollTo({ top: messageList.value.scrollHeight, behavior: 'smooth' })
   try {
     const response = await requestChat(settings.backend, settings, content)
     if (response.conversationId && !settings.conversationId) {
@@ -489,6 +523,7 @@ async function sendMessage() {
   } catch (error) {
     messages.value.push({ id: createMessageId(), role: 'assistant', content: error.message, meta: '请求失败' })
   } finally {
+    chatPending.value = false
     busy.value = false
     await nextTick()
     messageList.value?.scrollTo({ top: messageList.value.scrollHeight, behavior: 'smooth' })
@@ -497,12 +532,26 @@ async function sendMessage() {
 
 function usePrompt(prompt) { draft.value = prompt }
 
+function formatLatency(value) {
+  return `${Math.round(Number(value || 0))} ms`
+}
+
+function traceStatusLabel(status) {
+  return status === 'failed' ? '失败' : '成功'
+}
+
+function llmAgentLabel(agentType) {
+  const labels = { technical: '技术 Agent', billing: '账单 Agent', general: '通用 Agent', escalation: '升级 Agent', composer: '汇总器' }
+  return labels[agentType] || agentType || 'Agent'
+}
+
 function clearConversation() {
   messages.value = []
   lastResponse.value = null
   lastTrace.value = null
   settings.conversationId = ''
   persist()
+  persistConversation()
 }
 
 async function searchKnowledge() {

@@ -11,6 +11,7 @@ import pathlib
 import sys
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 
@@ -49,6 +50,7 @@ _tool_manager = None
 _monitor      = None
 _evaluator    = None
 _skill_manager = None
+_trace_repository = None
 
 def _anthropic_cfg() -> Dict[str, Any]:
     key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -66,7 +68,7 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _trace_repository
 
     print(BANNER, flush=True)
 
@@ -78,6 +80,7 @@ async def lifespan(app: FastAPI):
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
+    from core.trace_repository import TraceRepository
 
     cfg = _anthropic_cfg()
     logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
@@ -97,12 +100,17 @@ async def lifespan(app: FastAPI):
     )
     _skill_manager.load()
 
+    # Trace Repository：MySQL 不可用时自动退回内存 Trace，不阻塞服务启动。
+    _trace_repository = TraceRepository()
+    await _trace_repository.connect()
+
     # Agent 编排器
     _orchestrator = AgentOrchestrator(
         api_key=cfg["api_key"],
         base_url=cfg.get("base_url"),
         model=cfg["model"],
         skill_manager=_skill_manager,
+        trace_repository=_trace_repository,
     )
 
     # 记忆管理器（Redis 工作记忆 + ChromaDB 情景记忆/用户画像）
@@ -185,6 +193,8 @@ async def lifespan(app: FastAPI):
     await _monitor.stop()
     if _memory is not None:
         await _memory.close()
+    if _trace_repository is not None:
+        await _trace_repository.close()
     logger.info("EchoMind 已关闭")
 
 
@@ -412,10 +422,11 @@ async def monitor_summary():
 
 @app.get("/trace/tool/{request_id}", response_model=ToolTraceResponse)
 async def get_tool_trace(request_id: str):
-    """查看某次请求的工具调用明细。"""
+    """查看某次请求的完整 Trace，优先读取 MySQL 持久化记录。"""
     if _orchestrator is None:
         raise HTTPException(503, "服务未就绪")
-    trace = _orchestrator.get_tool_trace(request_id)
+    trace = await _trace_repository.get_trace(request_id) if _trace_repository is not None else None
+    trace = trace or _orchestrator.get_tool_trace(request_id)
     return ToolTraceResponse(
         request_id=request_id,
         found=trace is not None,
@@ -424,10 +435,25 @@ async def get_tool_trace(request_id: str):
 
 
 @app.get("/trace/tools", response_model=RecentToolTracesResponse)
-async def list_recent_tool_traces(limit: int = 20):
-    """查看最近 N 次请求的工具调用明细。"""
+async def list_recent_tool_traces(
+    limit: int = 20,
+    agent_type: Optional[str] = None,
+    tool_name: Optional[str] = None,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+):
+    """按时间、主 Agent、工具名筛选最近请求 Trace，优先读取 MySQL。"""
     if _orchestrator is None:
         raise HTTPException(503, "服务未就绪")
+    items = await _trace_repository.list_recent(
+        limit=limit,
+        agent_type=agent_type,
+        tool_name=tool_name,
+        start_time=start_time,
+        end_time=end_time,
+    ) if _trace_repository is not None else []
+    if items or any((agent_type, tool_name, start_time, end_time)):
+        return RecentToolTracesResponse(items=items)
     return RecentToolTracesResponse(items=_orchestrator.get_recent_tool_traces(limit=limit))
 
 
