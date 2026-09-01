@@ -64,7 +64,6 @@ def inspect_request_context(req: Request, args: Dict[str, Any]) -> Dict[str, Any
     return {
         "intent": req.intent.value if req.intent else None,
         "intent_group": req.intent_group,
-        "urgency": req.urgency.name if req.urgency else None,
         "intent_confidence": round(req.intent_confidence, 4),
         "entities": req.entities or {},
         "context_available": bool(req.context),
@@ -168,7 +167,6 @@ def create_handoff_summary(req: Request, args: Dict[str, Any]) -> Dict[str, Any]
         "request_id": req.request_id,
         "reason": str(args.get("reason", "需要人工客服继续核验"))[:120],
         "intent": req.intent.value if req.intent else "unknown",
-        "urgency": req.urgency.name if req.urgency else "UNKNOWN",
         "entities": req.entities or {},
         "sensitive_data_required": False,
     }
@@ -251,7 +249,7 @@ def general_tools() -> Dict[str, AgentToolSpec]:
     return {
         "inspect_request_context": make_tool(
             "inspect_request_context",
-            "查看当前请求的意图、紧急度、实体和上下文可用性；不查询外部业务系统。",
+            "查看当前请求的意图、实体和上下文可用性；不查询外部业务系统。",
             {"focus": {"type": "string", "description": "希望关注的业务方向"}},
             inspect_request_context,
         ),
@@ -315,4 +313,105 @@ def escalation_tools() -> Dict[str, AgentToolSpec]:
             {"reason": {"type": "string", "description": "需要升级的原因"}},
             create_handoff_summary,
         ),
+    }
+
+
+def build_business_tools(repository: Any, tool_manager: Optional[Any] = None) -> Dict[str, AgentToolSpec]:
+    """构建受可靠性治理的 MySQL 业务工具；模型只能调用预定义方法，不能执行任意 SQL。"""
+    from mcp.tool_manager import Tool
+
+    specs = {
+        "get_order_status": (
+            "查询当前用户指定订单的状态和金额。仅可查询当前用户的订单。",
+            {"order_id": {"type": "string", "description": "订单号，例如 ORD-DEMO-1001"}}, ["order_id"], 30.0,
+        ),
+        "get_order_payment_summary": (
+            "查询当前用户订单的真实支付流水，并识别是否疑似重复支付。",
+            {"order_id": {"type": "string", "description": "订单号，例如 ORD-DEMO-1001"}}, ["order_id"], 30.0,
+        ),
+        "get_refund_status": (
+            "查询当前用户指定订单的最新退款状态和金额。",
+            {"order_id": {"type": "string", "description": "订单号，例如 ORD-DEMO-1002"}}, ["order_id"], 30.0,
+        ),
+        "get_error_code_playbook": (
+            "从技术知识库查询错误码对应的标准排障手册。",
+            {"error_code": {"type": "string", "description": "HTTP 或系统错误码，例如 401、500"}}, ["error_code"], 300.0,
+        ),
+        "query_incident_status": (
+            "查询错误码对应的当前服务故障状态、影响范围和处理进度。",
+            {
+                "error_code": {"type": "string", "description": "HTTP 或系统错误码，例如 401、500"},
+                "service_name": {"type": "string", "description": "可选服务名，例如 auth-gateway"},
+            }, ["error_code"], 15.0,
+        ),
+        "request_human_handoff": (
+            "仅在当前请求确实需要人工介入时创建人工交接工单；不要仅因回复中提及升级条件而调用。",
+            {
+                "reason": {"type": "string", "description": "当前请求必须人工介入的具体原因"},
+                "priority": {"type": "string", "description": "normal、high 或 critical"},
+            }, ["reason"], 0.0,
+        ),
+    }
+
+    async def get_order_status(params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        return await repository.get_order_status(context["user_id"], params["order_id"])
+
+    async def get_order_payment_summary(params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        return await repository.get_order_payment_summary(context["user_id"], params["order_id"])
+
+    async def get_refund_status(params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        return await repository.get_refund_status(context["user_id"], params["order_id"])
+
+    async def get_error_code_playbook(params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        return await repository.get_error_code_playbook(params["error_code"])
+
+    async def query_incident_status(params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        return await repository.query_incident_status(params["error_code"], params.get("service_name", ""))
+
+    async def request_human_handoff(params: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        return await repository.create_handoff_ticket(
+            request_id=context["request_id"], user_id=context["user_id"],
+            category=context["intent_group"] or "general", priority=params.get("priority", "normal"),
+            reason=params["reason"],
+        )
+
+    handlers = {
+        "get_order_status": get_order_status,
+        "get_order_payment_summary": get_order_payment_summary,
+        "get_refund_status": get_refund_status,
+        "get_error_code_playbook": get_error_code_playbook,
+        "query_incident_status": query_incident_status,
+        "request_human_handoff": request_human_handoff,
+    }
+
+    def fallback(params: Dict[str, Any], context: Dict[str, Any], error: str) -> Dict[str, Any]:
+        return {"success": False, "fallback": True, "error": f"业务数据暂时不可用：{error}"}
+
+    if tool_manager is not None:
+        for name, (description, properties, required, cache_ttl) in specs.items():
+            tool_manager.register(Tool(
+                name=name, description=description, handler=handlers[name],
+                schema={"type": "object", "properties": properties, "required": required},
+                cache_ttl=cache_ttl, cache_context_keys=("user_id",),
+                timeout_s=5.0, fallback=fallback,
+            ))
+
+    async def execute(name: str, req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
+        context = {"user_id": req.user_id, "request_id": req.request_id, "intent_group": req.intent_group}
+        if tool_manager is None:
+            return await handlers[name](args, context)
+        result = await tool_manager.call(name, args, context, use_cache=name != "request_human_handoff")
+        if not result.success:
+            return {"success": False, "error": result.error or "业务工具调用失败"}
+        data = dict(result.data) if isinstance(result.data, dict) else {"success": True, "data": result.data}
+        data.setdefault("success", True)
+        if result.cached:
+            data["cached"] = True
+        if result.error:
+            data["degraded"] = True
+        return data
+
+    return {
+        name: make_tool(name, description, properties, lambda req, args, n=name: execute(n, req, args), required=required)
+        for name, (description, properties, required, _cache_ttl) in specs.items()
     }

@@ -51,6 +51,7 @@ _monitor      = None
 _evaluator    = None
 _skill_manager = None
 _trace_repository = None
+_business_repository = None
 
 def _anthropic_cfg() -> Dict[str, Any]:
     key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -68,11 +69,12 @@ def _anthropic_cfg() -> Dict[str, Any]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _trace_repository
+    global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager, _trace_repository, _business_repository
 
     print(BANNER, flush=True)
 
     from agents.agent_orchestrator import AgentOrchestrator, Request, build_shared_rag_tools
+    from agents.tools import build_business_tools
     from core.intent_recognizer import IntentRecognizer
     from evaluation.evaluator import EndToEndEvaluator
     from mcp.knowledge_base import KnowledgeBase
@@ -80,6 +82,7 @@ async def lifespan(app: FastAPI):
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
+    from core.business_repository import BusinessRepository
     from core.trace_repository import TraceRepository
 
     cfg = _anthropic_cfg()
@@ -104,6 +107,10 @@ async def lifespan(app: FastAPI):
     _trace_repository = TraceRepository()
     await _trace_repository.connect()
 
+    # 业务数据仓储：订单、支付、退款、故障与人工工单，为 Agent 提供真实 MySQL 工具调用。
+    _business_repository = BusinessRepository()
+    await _business_repository.connect()
+
     # Agent 编排器
     _orchestrator = AgentOrchestrator(
         api_key=cfg["api_key"],
@@ -111,6 +118,7 @@ async def lifespan(app: FastAPI):
         model=cfg["model"],
         skill_manager=_skill_manager,
         trace_repository=_trace_repository,
+        business_repository=_business_repository,
     )
 
     # 记忆管理器（Redis 工作记忆 + ChromaDB 情景记忆/用户画像）
@@ -130,6 +138,8 @@ async def lifespan(app: FastAPI):
         base_url=cfg.get("base_url"),
         model=cfg["model"],
     )
+    if _orchestrator is not None and _business_repository is not None:
+        _orchestrator.set_business_tools(build_business_tools(_business_repository, _tool_manager))
     kb = KnowledgeBase(
         chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
@@ -195,6 +205,8 @@ async def lifespan(app: FastAPI):
         await _memory.close()
     if _trace_repository is not None:
         await _trace_repository.close()
+    if _business_repository is not None:
+        await _business_repository.close()
     logger.info("EchoMind 已关闭")
 
 
@@ -314,8 +326,8 @@ async def chat(req: ChatRequest):
         entities=intent_result.entities,
         intent=intent_result.intent,
         intent_group=intent_result.intent_group,
-        urgency=intent_result.urgency,
         intent_confidence=intent_result.confidence,
+        intent_decision=intent_result.decision,
     )
 
     # 3. 执行

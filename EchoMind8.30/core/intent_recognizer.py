@@ -3,16 +3,17 @@
 
 三路融合策略：
   1. LLM 语义理解（权重 70%）—— 主力，理解复杂语义和上下文
-  2. Embedding 向量相似度（权重 20%）—— 快速匹配常见表达
+  2. 本地 BGE 向量相似度（权重 20%）—— 快速匹配常见表达
   3. 关键词模式匹配（权重 10%）—— 零延迟兜底
 
 三路结果通过加权投票合并，置信度低于阈值时降级为 OTHER。
-LLM 和 Embedding 并行调用，不串行等待。
+LLM 和 BGE 向量识别并行调用，不串行等待。
 """
 import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from anthropic import AsyncAnthropic
+import httpx
 
 from core.llm_utils import extract_text_content
 
@@ -48,35 +50,28 @@ class IntentCategory(Enum):
     OTHER      = "other"
 
 
-class UrgencyLevel(Enum):
-    LOW      = 1
-    MEDIUM   = 2
-    HIGH     = 3
-    CRITICAL = 4
-
-
 @dataclass
 class IntentResult:
     intent:     IntentCategory
     confidence: float
-    urgency:    UrgencyLevel
     intent_group: str
     entities:   Dict[str, List[str]]   # 从消息中提取的实体
     reasoning:  str
     latency_ms: float
     source_scores: Dict[str, float] = field(default_factory=dict)
+    decision: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 # ── Few-shot 模板（同时用于 LLM 示例和 Embedding 匹配）────────────────────────
 _TEMPLATES: Dict[IntentCategory, List[str]] = {
-    IntentCategory.QUERY:      ["我的订单状态是什么？", "如何重置密码？", "快递什么时候到？"],
+    IntentCategory.QUERY:      ["客服服务时间是什么？", "这个平台有哪些功能？", "如何使用这个服务？"],
     IntentCategory.COMPLAINT:  ["等了好几个小时！", "服务太差了！", "一直没人处理！"],
-    IntentCategory.REQUEST:    ["帮我取消订单", "我需要修改地址", "请协助退款"],
+    IntentCategory.REQUEST:    ["请帮我处理一个事项", "我需要协助完成操作", "请告诉我下一步怎么做"],
     IntentCategory.GREETING:   ["你好", "嗨，有人吗", "早上好"],
-    IntentCategory.ESCALATION: ["我要投诉！", "转人工客服", "找你们经理"],
-    IntentCategory.TECHNICAL:  ["应用一直崩溃", "无法登录", "出现500错误"],
-    IntentCategory.BILLING:    ["为什么扣了两次款？", "申请退款", "发票问题"],
-    IntentCategory.ACCOUNT:    ["修改邮箱", "注销账户", "更新个人信息"],
+    IntentCategory.ESCALATION: ["我要投诉服务流程", "我要联系负责人", "请升级为高级客服处理"],
+    IntentCategory.TECHNICAL:  ["系统功能无法正常使用", "服务响应异常", "页面加载不正常"],
+    IntentCategory.BILLING:    ["我想查看账单明细", "消费记录在哪里查看", "账单周期如何计算"],
+    IntentCategory.ACCOUNT:    ["怎么修改个人资料", "如何管理账户资料", "我要修改昵称"],
     IntentCategory.FEEDBACK:   ["服务很棒！", "非常满意", "给个好评"],
     IntentCategory.ORDER_STATUS: ["我的订单现在是什么状态？", "订单有没有发货？", "订单处理到哪一步了？"],
     IntentCategory.LOGISTICS: ["快递什么时候到？", "物流一直不更新", "配送要多久？"],
@@ -121,13 +116,9 @@ _INTENT_GROUPS: Dict[IntentCategory, IntentCategory] = {
     IntentCategory.HUMAN_HANDOFF: IntentCategory.ESCALATION,
 }
 
-# 紧急关键词
-_URGENCY_KEYWORDS = {
-    UrgencyLevel.CRITICAL: ["紧急", "emergency", "urgent", "asap", "立刻"],
-    UrgencyLevel.HIGH:     ["今天", "马上", "尽快", "hurry", "now"],
-    UrgencyLevel.MEDIUM:   ["这周", "soon", "快点"],
-}
-
+# 父类与同组子类的向量相似度只差极小时，优先输出可执行的细粒度意图。
+# 该阈值只解决语义近似造成的层级竞争，不会把明显更接近父类的请求强行归入子类。
+_PARENT_CHILD_SCORE_MARGIN = 0.03
 
 def _cosine(a: List[float], b: List[float]) -> float:
     """纯 Python 余弦相似度，不依赖 numpy。"""
@@ -141,8 +132,7 @@ class IntentRecognizer:
     """
     端到端意图识别器。
 
-    初始化时不加载任何本地模型，所有 AI 能力通过 Anthropic API 调用。
-    模板 Embedding 在首次请求时懒加载并缓存，后续复用。
+    模板向量由本地 BGE 服务生成并缓存；服务不可用时回退字符 n-gram。
     """
 
     def __init__(
@@ -158,11 +148,11 @@ class IntentRecognizer:
         self.client    = AsyncAnthropic(**kwargs)
         self.model     = model
         self.threshold = confidence_threshold
-        # 本地字符 n-gram 向量始终可用；如果未来客户端暴露 embeddings 资源，
-        # _embed_text 会优先尝试远端向量，否则自动回退本地向量。
+        # BGE 服务不可用时不影响主链路，回退到字符 n-gram。
         self._embedding_enabled = True
-
         self._tpl_embeddings: Dict[IntentCategory, List[List[float]]] = {}
+        self._embedding_url = os.getenv("ECHOMIND_EMBEDDING_URL", "http://embedding:8080/embed").rstrip("/")
+        self._embedding_timeout_s = float(os.getenv("ECHOMIND_EMBEDDING_TIMEOUT_S", "5"))
         self._cache: Dict[str, IntentResult] = {}
         self.cache_hits   = 0
         self.cache_misses = 0
@@ -200,17 +190,22 @@ class IntentRecognizer:
 
         intent, confidence, source_scores = self._vote(llm, emb, pat)
         entities = self._extract_entities(message)
-        urgency  = self._urgency(message, intent)
+        decision = {
+            "llm": self._decision_item(llm),
+            "embedding": self._decision_item(emb),
+            "pattern": self._decision_item(pat),
+            "final": {"intent": intent.value, "confidence": float(confidence)},
+        }
 
         result = IntentResult(
             intent=intent,
             confidence=confidence,
-            urgency=urgency,
             intent_group=self._intent_group(intent),
             entities=entities,
             reasoning=llm.get("reasoning", ""),
             latency_ms=(time.monotonic() - t0) * 1000,
             source_scores=source_scores,
+            decision=decision,
         )
 
         # LRU 缓存
@@ -290,11 +285,20 @@ class IntentRecognizer:
             await self._load_template_embeddings()
             msg_vec = await self._embed_text(message)
 
-            best_cat, best_score = IntentCategory.OTHER, 0.0
+            category_scores: Dict[IntentCategory, float] = {}
             for cat, vecs in self._tpl_embeddings.items():
-                score = max(_cosine(msg_vec, v) for v in vecs)
-                if score > best_score:
-                    best_score, best_cat = score, cat
+                category_scores[cat] = max(_cosine(msg_vec, v) for v in vecs)
+
+            best_cat, best_score = max(category_scores.items(), key=lambda item: item[1])
+            child_scores = [
+                (cat, score)
+                for cat, score in category_scores.items()
+                if _INTENT_GROUPS.get(cat) == best_cat
+            ]
+            if child_scores:
+                best_child, child_score = max(child_scores, key=lambda item: item[1])
+                if child_score >= best_score - _PARENT_CHILD_SCORE_MARGIN:
+                    best_cat, best_score = best_child, child_score
 
             return {"intent": best_cat, "confidence": best_score}
         except Exception as ex:
@@ -389,13 +393,13 @@ class IntentRecognizer:
     # ── 辅助 ──────────────────────────────────────────────────────────────────
 
     async def _load_template_embeddings(self) -> None:
-        """懒加载所有模板的 Embedding（只在首次调用时执行）。"""
+        """懒加载所有模板向量（只在首次调用时执行）。"""
         missing = [cat for cat in _TEMPLATES if cat not in self._tpl_embeddings]
         if not missing:
             return
 
         all_texts = [t for cat in missing for t in _TEMPLATES[cat]]
-        vecs = [await self._embed_text(text) for text in all_texts]
+        vecs = await self._embed_texts(all_texts)
         idx = 0
         for cat in missing:
             n = len(_TEMPLATES[cat])
@@ -403,22 +407,25 @@ class IntentRecognizer:
             idx += n
 
     async def _embed_text(self, text: str) -> List[float]:
-        """
-        生成文本向量。
+        return (await self._embed_texts([text]))[0]
 
-        如果未来接入的官方/兼容客户端提供 embeddings.create，会优先使用远端向量；
-        当前 Anthropic SDK 没有该资源时，退化为字符 n-gram 哈希向量。这样不会因为
-        Embedding 服务缺失导致三路融合中断。
-        """
-        embeddings = getattr(self.client, "embeddings", None)
-        if embeddings is not None:
-            try:
-                resp = await embeddings.create(model="voyage-3-lite", input=[text])
-                return list(resp.data[0].embedding)
-            except Exception as ex:
-                logger.warning(f"远端 Embedding 失败，使用本地向量兜底: {ex}")
+    async def _embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """优先调用本地 BGE 服务批量编码；异常时回退到字符 n-gram。"""
+        cleaned = [self._clean_text(text) for text in texts]
+        try:
+            vectors = await self._request_embeddings(cleaned)
+            if len(vectors) != len(cleaned) or any(not isinstance(vector, list) for vector in vectors):
+                raise ValueError("Embedding 服务返回的向量数量或格式不正确")
+            return [[float(value) for value in vector] for vector in vectors]
+        except Exception as ex:
+            logger.warning("本地 BGE Embedding 服务不可用，使用字符 n-gram 兜底: %s", ex)
+            return [self._local_embedding(text) for text in cleaned]
 
-        return self._local_embedding(text)
+    async def _request_embeddings(self, texts: List[str]) -> List[List[float]]:
+        async with httpx.AsyncClient(timeout=self._embedding_timeout_s) as client:
+            response = await client.post(self._embedding_url, json={"texts": texts})
+            response.raise_for_status()
+            return response.json()["vectors"]
 
     @staticmethod
     def _local_embedding(text: str, dims: int = 256) -> List[float]:
@@ -438,17 +445,6 @@ class IntentRecognizer:
             sign = 1.0 if digest[4] % 2 == 0 else -1.0
             vec[idx] += sign
         return vec
-
-    def _urgency(self, message: str, intent: IntentCategory) -> UrgencyLevel:
-        msg = message.lower()
-        for level, kws in _URGENCY_KEYWORDS.items():
-            if any(kw in msg for kw in kws):
-                return level
-        if intent in (IntentCategory.ESCALATION, IntentCategory.HUMAN_HANDOFF):
-            return UrgencyLevel.HIGH
-        if intent == IntentCategory.COMPLAINT:
-            return UrgencyLevel.MEDIUM
-        return UrgencyLevel.LOW
 
     def _cache_key(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
         payload = {"message": self._clean_text(message)[:200]}
@@ -482,6 +478,12 @@ class IntentRecognizer:
             if score > best_score:
                 best_score, best_cat = score, cat
         return best_cat, best_score
+
+    @staticmethod
+    def _decision_item(result: Dict[str, Any]) -> Dict[str, Any]:
+        intent = result.get("intent", IntentCategory.OTHER)
+        value = intent.value if isinstance(intent, IntentCategory) else str(intent)
+        return {"intent": value, "confidence": float(result.get("confidence", 0.0) or 0.0)}
 
     @staticmethod
     def _intent_group(intent: IntentCategory) -> str:

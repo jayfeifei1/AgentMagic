@@ -70,10 +70,10 @@ docker compose logs -f echomind
 
 ### 4. 访问入口
 
-- API: `http://localhost:8000`
-- Swagger: `http://localhost:8000/docs`
+- API: `http://localhost:8100`
+- Swagger: `http://localhost:8100/docs`
 - Nginx: `http://localhost`
-- Health: `http://localhost:8000/health`
+- Health: `http://localhost:8100/health`
 
 ## 核心功能
 
@@ -127,7 +127,7 @@ data/                       持久化数据
 用户请求
   -> /chat
   -> MemoryManager 读取工作记忆、情景记忆、用户画像
-  -> IntentRecognizer 输出 intent / intent_group / urgency / entities
+  -> IntentRecognizer 输出 intent / intent_group / entities
   -> 按意图决定是否检索知识库
   -> AgentOrchestrator 路由到 General / Technical / Billing / Escalation
   -> Skills 注入、工具调用、回复生成
@@ -140,7 +140,7 @@ data/                       持久化数据
 
 | 服务 | 端口 |
 |---|---:|
-| EchoMind API | 8000 |
+| EchoMind API | 8100 |
 | ChromaDB | 8001 |
 | Redis | 6379 |
 | Prometheus | 9090 |

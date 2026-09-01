@@ -88,6 +88,23 @@ services:
       retries: 3
       start_period: 10s
 
+  # ── 本地 BGE Embedding 服务（意图模板相似度）─────────────────────────────────
+  embedding:
+    build:
+      context: ./embedding_service
+    container_name: echomind-embedding
+    ports:
+      - "8101:8080"
+    restart: unless-stopped
+    networks:
+      - echomind-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
   # ── EchoMind 主应用 ─────────────────────────────────────────────────────────
   echomind:
     build:
@@ -96,7 +113,7 @@ services:
       target: production
     container_name: echomind-app
     ports:
-      - "8000:8000"
+      - "8100:8000"
     env_file:
       - .env
       - mysql.env
@@ -109,6 +126,7 @@ services:
       - MYSQL_HOST=mysql
       - MYSQL_PORT=3306
       - ECHOMIND_TRACE_UTC_OFFSET_HOURS=8
+      - ECHOMIND_EMBEDDING_URL=http://embedding:8080/embed
     volumes:
       - ./data/chroma:/app/data/chroma
       - ./data/eval:/app/data/eval
@@ -120,6 +138,8 @@ services:
       chromadb:
         condition: service_healthy
       mysql:
+        condition: service_healthy
+      embedding:
         condition: service_healthy
     restart: unless-stopped
     networks:

@@ -32,14 +32,10 @@ from anthropic import AsyncAnthropic
 
 from agents.tools import (
     AgentToolSpec,
+    build_business_tools,
     build_shared_rag_tools,
-    billing_tools,
-    escalation_tools,
-    general_tools,
-    human_handoff_tools,
-    technical_tools,
 )
-from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
+from core.intent_recognizer import IntentCategory, IntentRecognizer
 from core.llm_utils import extract_text_content
 from core.trace_time import trace_now
 
@@ -88,6 +84,12 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _deepseek_extra_body() -> Optional[Dict[str, Any]]:
+    if "deepseek" in os.getenv("ANTHROPIC_BASE_URL", "").lower():
+        return {"reasoning": {"effort": "none"}}
+    return None
+
+
 @dataclass
 class AgentStats:
     """Agent 运行时统计，供 Monitor 和路由决策使用。"""
@@ -122,6 +124,7 @@ class AgentResponse:
     tools_used:  List[str] = field(default_factory=list)
     tool_traces: List[Dict[str, Any]] = field(default_factory=list)
     llm_traces: List[Dict[str, Any]] = field(default_factory=list)
+    error:       str = ""
 
 
 @dataclass
@@ -160,8 +163,8 @@ class Request:
     entities:    Dict[str, List[str]] = field(default_factory=dict)
     intent:      Optional[IntentCategory] = None
     intent_group: Optional[str] = None
-    urgency:     Optional[UrgencyLevel]   = None
     intent_confidence: float = 1.0
+    intent_decision: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     request_id:  str = field(default_factory=lambda: str(uuid.uuid4())[:8])
 
 
@@ -182,6 +185,9 @@ class OrchestratorResult:
     routing_confidence: float = 0.0
     success: bool = True
     llm_traces: List[Dict[str, Any]] = field(default_factory=list)
+    agent_executions: List[Dict[str, Any]] = field(default_factory=list)
+    composer_content: str = ""
+    intent_decision: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -216,6 +222,7 @@ class BaseAgent:
         model: str,
         skill_manager: Optional[Any] = None,
         profile: Optional[AgentProfile] = None,
+        business_repository: Optional[Any] = None,
     ):
         self._client = client
         self.profile = profile or self.profile
@@ -223,13 +230,23 @@ class BaseAgent:
         self._skill_manager = skill_manager
         self.stats   = AgentStats()
         self._shared_tools: Dict[str, AgentToolSpec] = {}
+        self._business_tools: Dict[str, AgentToolSpec] = {}
+        self._business_repository = business_repository
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         """返回该角色真实可调用的工具白名单。"""
-        return dict(self._shared_tools)
+        tools = dict(self._shared_tools)
+        tools.update(self._business_tools)
+        return tools
 
     def set_shared_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
         self._shared_tools = dict(tools or {})
+
+    def set_business_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
+        all_tools = dict(tools or {})
+        self._business_tools = {
+            name: spec for name, spec in all_tools.items() if name in self.profile.tool_scope
+        }
 
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
@@ -261,6 +278,7 @@ class BaseAgent:
                 tools_used=ex.tools_used,
                 tool_traces=ex.tool_traces,
                 llm_traces=ex.llm_traces,
+                error=str(ex),
             )
         except Exception as ex:
             ms = (time.monotonic() - t0) * 1000
@@ -271,6 +289,7 @@ class BaseAgent:
                 content="抱歉，处理您的请求时出现问题，请稍后重试。",
                 success=False,
                 latency_ms=ms,
+                error=str(ex),
             )
 
     async def _call_llm(self, req: Request) -> AgentExecution:
@@ -296,6 +315,7 @@ class BaseAgent:
         tool_traces: List[Dict[str, Any]] = []
         llm_traces: List[Dict[str, Any]] = []
         escalate = False
+        force_final_answer = False
         for round_no in range(1, 4):
             request_kwargs: Dict[str, Any] = {
                 "model": self._model,
@@ -304,7 +324,10 @@ class BaseAgent:
                 "system": self._build_system_prompt(req),
                 "messages": messages,
             }
-            if tools:
+            extra_body = _deepseek_extra_body()
+            if extra_body is not None:
+                request_kwargs["extra_body"] = extra_body
+            if tools and not force_final_answer:
                 request_kwargs["tools"] = [
                     {
                         "name": spec.name,
@@ -341,12 +364,28 @@ class BaseAgent:
             })
             tool_uses = [block for block in (resp.content or []) if self._block_type(block) == "tool_use"]
             if not tool_uses:
-                return AgentExecution(
-                    content=extract_text_content(resp.content),
-                    tools_used=tools_used,
-                    tool_traces=tool_traces,
-                    llm_traces=llm_traces,
-                    escalate=escalate,
+                content = extract_text_content(resp.content).strip()
+                if content:
+                    return AgentExecution(
+                        content=content,
+                        tools_used=tools_used,
+                        tool_traces=tool_traces,
+                        llm_traces=llm_traces,
+                        escalate=escalate,
+                    )
+                if not force_final_answer and round_no < 3:
+                    force_final_answer = True
+                    messages.append({"role": "assistant", "content": resp.content})
+                    messages.append({
+                        "role": "user",
+                        "content": "请基于已获得的信息直接输出面向用户的最终答复。不要调用工具，也不要返回空内容。",
+                    })
+                    continue
+                raise AgentExecutionError(
+                    f"{self.agent_type.value} Agent 未返回最终文本",
+                    tools_used,
+                    tool_traces,
+                    llm_traces,
                 )
 
             messages.append({"role": "assistant", "content": resp.content})
@@ -476,7 +515,6 @@ class BaseAgent:
             "agent_type": self.agent_type.value,
             "intent": req.intent.value if req.intent else None,
             "intent_group": req.intent_group,
-            "urgency": req.urgency.name if req.urgency else None,
             "intent_confidence": round(req.intent_confidence, 4),
             "available_entities": req.entities or {},
         }
@@ -488,12 +526,12 @@ class GeneralAgent(BaseAgent):
         role="通用客服分诊与首轮接待",
         mission="快速回答基础问题，澄清不完整需求，并识别是否需要专业 Agent 或人工处理。",
         workflow=("复述诉求", "判断业务范围", "直接回答或补充必要信息", "给出下一步"),
-        input_contract=("对话历史", "用户画像", "意图与紧急度", "知识库上下文"),
+        input_contract=("对话历史", "用户画像", "意图", "知识库上下文"),
         output_contract=("先回应核心问题", "信息不足时只询问必要字段", "明确下一步和边界"),
         handoff_conditions=("涉及权限、资金、隐私或复杂投诉", "用户明确要求人工"),
-        tool_scope=("search_knowledge_base", "inspect_request_context", "suggest_required_fields", "request_human_handoff"),
+        tool_scope=("search_knowledge_base", "get_order_status", "request_human_handoff"),
         temperature=0.3,
-        max_tokens=900,
+        max_tokens=8192,
     )
     system_prompt = (
         "你是 EchoMind 智能客服。友好、简洁地回答用户问题。"
@@ -507,10 +545,7 @@ class GeneralAgent(BaseAgent):
         return json.dumps(packet, ensure_ascii=False)
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
-        tools = super().get_tools()
-        tools.update(general_tools())
-        tools.update(human_handoff_tools())
-        return tools
+        return super().get_tools()
 
 
 class TechnicalAgent(BaseAgent):
@@ -522,9 +557,9 @@ class TechnicalAgent(BaseAgent):
         input_contract=("错误码", "问题发生时间", "运行环境", "影响范围", "最近变更", "知识库上下文"),
         output_contract=("现象复述", "可能原因", "编号排查步骤", "验证结果", "需要补充的信息"),
         handoff_conditions=("生产大面积不可用", "数据丢失或权限异常", "需要后台日志、数据库或人工操作"),
-        tool_scope=("search_knowledge_base", "lookup_error_code", "build_diagnostic_plan", "request_human_handoff"),
+        tool_scope=("search_knowledge_base", "get_error_code_playbook", "query_incident_status", "request_human_handoff"),
         temperature=0.1,
-        max_tokens=1200,
+        max_tokens=8192,
     )
     system_prompt = (
         "你是技术支持专家。专注于：故障排查、错误诊断、系统配置。"
@@ -541,10 +576,7 @@ class TechnicalAgent(BaseAgent):
         return json.dumps(packet, ensure_ascii=False)
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
-        tools = super().get_tools()
-        tools.update(technical_tools())
-        tools.update(human_handoff_tools())
-        return tools
+        return super().get_tools()
 
 
 class BillingAgent(BaseAgent):
@@ -556,9 +588,9 @@ class BillingAgent(BaseAgent):
         input_contract=("订单号", "金额与币种", "支付时间", "支付渠道", "用户期望", "知识库上下文"),
         output_contract=("需要核验的信息", "当前可判断内容", "下一步处理路径", "时效边界"),
         handoff_conditions=("实际退款或补偿", "重复扣款或支付成功但订单未生效", "发票作废/重开", "企业合同或大额订单"),
-        tool_scope=("search_knowledge_base", "check_billing_fields", "compare_amounts", "request_human_handoff"),
+        tool_scope=("search_knowledge_base", "get_order_payment_summary", "get_refund_status", "request_human_handoff"),
         temperature=0.0,
-        max_tokens=1100,
+        max_tokens=8192,
     )
     system_prompt = (
         "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
@@ -582,10 +614,7 @@ class BillingAgent(BaseAgent):
         return json.dumps(packet, ensure_ascii=False)
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
-        tools = super().get_tools()
-        tools.update(billing_tools())
-        tools.update(human_handoff_tools())
-        return tools
+        return super().get_tools()
 
 
 class EscalationAgent(BaseAgent):
@@ -600,42 +629,72 @@ class EscalationAgent(BaseAgent):
         role="人工升级与交接",
         mission="确认升级原因，整理已知上下文，告知用户下一步，不执行未经授权的业务操作。",
         workflow=("确认升级原因", "整理已知信息", "标记优先级", "生成交接摘要"),
-        input_contract=("用户消息", "意图", "紧急度", "结构化实体", "对话背景"),
+        input_contract=("用户消息", "意图", "结构化实体", "对话背景"),
         output_contract=("升级原因", "已知信息摘要", "还需补充的信息", "保守的后续说明"),
-        handoff_conditions=("用户明确要求人工", "紧急或高风险场景"),
-        tool_scope=("search_knowledge_base", "create_handoff_summary"),
+        handoff_conditions=("用户明确要求人工", "投诉升级或 Agent 明确发起交接"),
+        tool_scope=(),
         temperature=0.0,
-        max_tokens=500,
+        max_tokens=8192,
     )
     system_prompt = "你负责客服人工升级交接，不要继续模拟已完成的后台操作。"
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
-        tools = super().get_tools()
-        tools.update(escalation_tools())
-        return tools
+        return {}
 
     async def handle(self, req: Request) -> AgentResponse:
         t0 = time.monotonic()
         self.stats.total += 1
         intent = req.intent.value if req.intent else "unknown"
-        urgency = req.urgency.name if req.urgency else "UNKNOWN"
-        entities = json.dumps(req.entities or {}, ensure_ascii=False)
-        content = (
-            "我已将这个问题标记为人工升级处理。\n\n"
-            f"升级原因：意图={intent}，紧急度={urgency}\n"
-            f"已记录信息：{entities}\n"
-            "请不要发送密码、短信验证码或完整支付凭证；人工客服会根据会话记录继续核验。"
-        )
+        reason = f"用户请求人工处理；意图={intent}"
+        priority = "high"
+        tool_t0 = time.monotonic()
+        if self._business_repository is None:
+            ticket = {"success": False, "error": "业务工单服务未初始化"}
+        else:
+            ticket = await self._business_repository.create_handoff_ticket(
+                request_id=req.request_id,
+                user_id=req.user_id,
+                category=req.intent_group or "escalation",
+                priority=priority,
+                reason=reason,
+            )
+        tool_latency_ms = round((time.monotonic() - tool_t0) * 1000, 1)
+        if ticket.get("success"):
+            content = (
+                "已为您创建人工交接工单。\n\n"
+                f"工单号：{ticket['ticket_id']}\n"
+                f"优先级：{ticket['priority']}\n"
+                "请不要发送密码、短信验证码或完整支付凭证；人工客服会根据会话记录继续核验。"
+            )
+        else:
+            content = "当前无法创建人工交接工单，请稍后重试。"
         ms = (time.monotonic() - t0) * 1000
-        self.stats.success += 1
+        success = bool(ticket.get("success"))
+        if success:
+            self.stats.success += 1
         self.stats.total_ms += ms
         return AgentResponse(
             agent_type=self.agent_type,
             content=content,
-            success=True,
+            success=success,
             latency_ms=ms,
+            error=str(ticket.get("error", "") or ""),
             escalate=True,
-            tools_used=[],
+            tools_used=["create_handoff_ticket"] if success else [],
+            tool_traces=[{
+                "agent_type": self.agent_type.value,
+                "tool_name": "create_handoff_ticket",
+                "tool_use_id": None,
+                "input": {"reason": reason, "priority": priority},
+                "result_summary": self._trace_result_summary(ticket),
+                "success": success,
+                "result_success": success,
+                "latency_ms": tool_latency_ms,
+                "cached": False,
+                "reranked": False,
+                "error": str(ticket.get("error", "") or ""),
+                "timestamp": trace_now().isoformat(),
+            }],
         )
 
 
@@ -675,11 +734,17 @@ class ResponseComposer:
         llm_timestamp = trace_now().isoformat()
         llm_traces: List[Dict[str, Any]] = []
         try:
+            request_kwargs: Dict[str, Any] = {
+                "model": self._model,
+                "max_tokens": _env_int("ECHOMIND_COMPOSER_MAX_TOKENS", 8192),
+                "temperature": _env_float("ECHOMIND_COMPOSER_TEMPERATURE", 0.1),
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            extra_body = _deepseek_extra_body()
+            if extra_body is not None:
+                request_kwargs["extra_body"] = extra_body
             response = await self._client.messages.create(
-                model=self._model,
-                max_tokens=_env_int("ECHOMIND_COMPOSER_MAX_TOKENS", 1000),
-                temperature=_env_float("ECHOMIND_COMPOSER_TEMPERATURE", 0.1),
-                messages=[{"role": "user", "content": prompt}],
+                **request_kwargs,
             )
             content = extract_text_content(response.content).strip()
             llm_traces.append({
@@ -753,6 +818,7 @@ class AgentOrchestrator:
         skill_manager: Optional[Any] = None,
         rag_tool_manager: Optional[Any] = None,
         trace_repository: Optional[Any] = None,
+        business_repository: Optional[Any] = None,
     ):
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
@@ -763,17 +829,19 @@ class AgentOrchestrator:
         self._skill_manager = skill_manager
         self._composer = ResponseComposer(client, model, skill_manager)
         self._shared_tools: Dict[str, AgentToolSpec] = {}
+        self._business_tools = build_business_tools(business_repository) if business_repository is not None else {}
         self._recent_tool_traces = deque(maxlen=_env_int("ECHOMIND_TOOL_TRACE_MAX", 200))
         self._trace_repository = trace_repository
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
-            AgentType.GENERAL: [self._make_agent(GeneralAgent, client, model, skill_manager)],
-            AgentType.TECHNICAL: [self._make_agent(TechnicalAgent, client, model, skill_manager)],
-            AgentType.BILLING: [self._make_agent(BillingAgent, client, model, skill_manager)],
-            AgentType.ESCALATION: [self._make_agent(EscalationAgent, client, model, skill_manager)],
+            AgentType.GENERAL: [self._make_agent(GeneralAgent, client, model, skill_manager, business_repository)],
+            AgentType.TECHNICAL: [self._make_agent(TechnicalAgent, client, model, skill_manager, business_repository)],
+            AgentType.BILLING: [self._make_agent(BillingAgent, client, model, skill_manager, business_repository)],
+            AgentType.ESCALATION: [self._make_agent(EscalationAgent, client, model, skill_manager, business_repository)],
         }
         self.set_shared_tools(build_shared_rag_tools(rag_tool_manager))
+        self.set_business_tools(self._business_tools)
 
     @staticmethod
     def _make_agent(
@@ -781,6 +849,7 @@ class AgentOrchestrator:
         client: AsyncAnthropic,
         default_model: str,
         skill_manager: Optional[Any],
+        business_repository: Optional[Any],
     ) -> BaseAgent:
         """按角色创建 Agent，并允许用环境变量覆盖该角色的模型。
 
@@ -790,7 +859,13 @@ class AgentOrchestrator:
         env_name = f"ECHOMIND_{agent_cls.agent_type.value.upper()}_MODEL"
         model = os.getenv(env_name, "").strip() or profile.model
         configured_profile = replace(profile, model=model) if model else profile
-        return agent_cls(client, default_model, skill_manager, profile=configured_profile)
+        return agent_cls(
+            client,
+            default_model,
+            skill_manager,
+            profile=configured_profile,
+            business_repository=business_repository,
+        )
 
     def set_skill_manager(self, skill_manager: Optional[Any]) -> None:
         """更新 SkillManager 引用，供运行时重载或测试替换使用。"""
@@ -807,6 +882,12 @@ class AgentOrchestrator:
             for agent in agents:
                 agent.set_shared_tools(self._shared_tools)
 
+    def set_business_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
+        self._business_tools = dict(tools or {})
+        for agents in self._pool.values():
+            for agent in agents:
+                agent.set_business_tools(self._business_tools)
+
     async def recognize_intent(
         self,
         message: str,
@@ -820,11 +901,15 @@ class AgentOrchestrator:
             "request_id": result.request_id,
             "timestamp": trace_now().isoformat(),
             "intent": result.intent.value if result.intent else None,
+            "intent_decision": result.intent_decision,
             "primary_agent": result.primary_agent.value if result.primary_agent else None,
             "supporting_agents": [agent.value for agent in result.supporting_agents],
             "tools_used": list(result.tools_used),
             "tool_calls": list(result.tool_traces),
             "llm_calls": list(result.llm_traces),
+            "agent_executions": list(result.agent_executions),
+            "composer_content": result.composer_content,
+            "final_response": result.response,
             "escalated": result.escalated,
             "latency_ms": round(result.latency_ms, 1),
             "status": "success" if result.success else "failed",
@@ -834,6 +919,31 @@ class AgentOrchestrator:
         self._recent_tool_traces.append(trace)
         if self._trace_repository is not None:
             await self._trace_repository.persist(trace)
+
+    @staticmethod
+    def _agent_execution_trace(agent_type: AgentType, result: Any) -> Dict[str, Any]:
+        if isinstance(result, AgentResponse):
+            content = (result.content or "").strip()
+            return {
+                "agent_type": result.agent_type.value,
+                "status": "success" if result.success else "failed",
+                "success": result.success,
+                "latency_ms": round(result.latency_ms, 1),
+                "content_length": len(content),
+                "content_preview": content,
+                "error": result.error,
+                "timestamp": trace_now().isoformat(),
+            }
+        return {
+            "agent_type": agent_type.value,
+            "status": "failed",
+            "success": False,
+            "latency_ms": 0.0,
+            "content_length": 0,
+            "content_preview": "",
+            "error": str(result),
+            "timestamp": trace_now().isoformat(),
+        }
 
     def get_tool_trace(self, request_id: str) -> Optional[Dict[str, Any]]:
         for trace in reversed(self._recent_tool_traces):
@@ -861,8 +971,8 @@ class AgentOrchestrator:
             intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
             req.intent  = intent_result.intent
             req.intent_group = intent_result.intent_group
-            req.urgency = intent_result.urgency
             req.intent_confidence = intent_result.confidence
+            req.intent_decision = intent_result.decision
 
         if self._needs_clarification(req):
             result = OrchestratorResult(
@@ -876,6 +986,7 @@ class AgentOrchestrator:
                 primary_agent=AgentType.GENERAL,
                 routing_reason="低置信度 OTHER 意图，先澄清用户需求",
                 routing_confidence=req.intent_confidence,
+                intent_decision=req.intent_decision,
             )
             await self._record_tool_trace(result)
             return result
@@ -890,12 +1001,12 @@ class AgentOrchestrator:
 
         # 4. 升级检查
         escalated = False
-        if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent in (
+        if response.escalate or req.intent in (
             IntentCategory.ESCALATION,
             IntentCategory.HUMAN_HANDOFF,
         ):
             escalated = True
-            logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
+            logger.warning(f"请求 {req.request_id} 触发升级: intent={req.intent}")
             # 生产环境：此处创建工单、通知人工客服
 
         result = OrchestratorResult(
@@ -914,6 +1025,8 @@ class AgentOrchestrator:
             routing_confidence=decision.confidence,
             success=response.success,
             llm_traces=list(response.llm_traces),
+            agent_executions=[self._agent_execution_trace(decision.primary_agent, response)],
+            intent_decision=req.intent_decision,
         )
         await self._record_tool_trace(result)
         return result
@@ -947,6 +1060,10 @@ class AgentOrchestrator:
             for response in valid_responses
             for trace in response.llm_traces
         ] + composition.llm_traces
+        agent_executions = [
+            self._agent_execution_trace(agent_type, response)
+            for agent_type, response in zip(agent_types, responses)
+        ]
         result = OrchestratorResult(
             request_id=req.request_id,
             response=combined,
@@ -966,22 +1083,21 @@ class AgentOrchestrator:
             routing_confidence=decision.confidence,
             success=any(response.success for response in valid_responses),
             llm_traces=llm_traces,
+            agent_executions=agent_executions,
+            composer_content=combined,
+            intent_decision=req.intent_decision,
         )
         await self._record_tool_trace(result)
         return result
 
     # ── 路由逻辑 ──────────────────────────────────────────────────────────────
 
-    def _route(self, intent: Optional[IntentCategory], urgency: Optional[UrgencyLevel]) -> AgentType:
+    def _route(self, intent: Optional[IntentCategory]) -> AgentType:
         """
         三层路由决策：
           1. 意图映射
-          2. 紧急度覆盖（CRITICAL 直接升级）
-          3. 默认 GENERAL
+          2. 默认 GENERAL
         """
-        if urgency == UrgencyLevel.CRITICAL:
-            return AgentType.ESCALATION
-
         if intent and intent in self._INTENT_ROUTING:
             target = self._INTENT_ROUTING[intent]
             # 如果目标类型有可用实例则使用，否则降级
@@ -994,16 +1110,9 @@ class AgentOrchestrator:
         """
         结构化路由决策。
 
-        先处理紧急/转人工，再用领域分数决定主 Agent 和辅助 Agent。
+        先处理转人工，再用领域分数决定主 Agent 和辅助 Agent。
         这样可以表达“主处理 + 辅助诊断”，避免关键词命中后无主次地拼接。
         """
-        if req.urgency == UrgencyLevel.CRITICAL:
-            return RoutingDecision(
-                primary_agent=AgentType.ESCALATION,
-                reason="紧急度为 CRITICAL，触发升级路由",
-                confidence=1.0,
-            )
-
         if req.intent in (IntentCategory.ESCALATION, IntentCategory.HUMAN_HANDOFF):
             return RoutingDecision(
                 primary_agent=AgentType.ESCALATION,
@@ -1024,15 +1133,35 @@ class AgentOrchestrator:
                 confidence=0.1,
             )
 
-        ordered = sorted(available_scores.items(), key=lambda item: item[1], reverse=True)
-        primary_agent, primary_score = ordered[0]
-        supporting_agents = [
+        composite_targets = [
             agent_type
-            for agent_type, score in ordered[1:]
-            if agent_type != AgentType.GENERAL and score >= 0.45 and score >= primary_score * 0.55
+            for agent_type in self._collaboration_targets(req)
+            if agent_type in available_scores
         ]
+        candidate_scores = available_scores
+        if len(composite_targets) >= 2:
+            candidate_scores = {
+                agent_type: available_scores[agent_type]
+                for agent_type in composite_targets
+            }
+
+        ordered = sorted(candidate_scores.items(), key=lambda item: item[1], reverse=True)
+        primary_agent, primary_score = ordered[0]
+        if len(composite_targets) >= 2:
+            supporting_agents = [
+                agent_type for agent_type in composite_targets
+                if agent_type != primary_agent
+            ]
+        else:
+            supporting_agents = [
+                agent_type
+                for agent_type, score in ordered[1:]
+                if agent_type != AgentType.GENERAL and score >= 0.45 and score >= primary_score * 0.55
+            ]
 
         reason = self._routing_reason(req, available_scores, primary_agent, supporting_agents)
+        if len(composite_targets) >= 2:
+            reason += ", composite_targets=" + ",".join(agent.value for agent in composite_targets)
         return RoutingDecision(
             primary_agent=primary_agent,
             supporting_agents=supporting_agents,
@@ -1087,6 +1216,8 @@ class AgentOrchestrator:
         general_hits = sum(1 for kw in general_kws if kw in msg)
 
         scores[AgentType.TECHNICAL] += min(0.45, technical_hits * 0.18)
+        if self._has_login_issue_signal(msg):
+            scores[AgentType.TECHNICAL] += 0.36
         scores[AgentType.BILLING] += min(0.45, billing_hits * 0.18)
         scores[AgentType.GENERAL] += min(0.35, general_hits * 0.12)
 
@@ -1135,7 +1266,7 @@ class AgentOrchestrator:
             IntentCategory.TECHNICAL,
             IntentCategory.TECHNICAL_LOGIN,
             IntentCategory.TECHNICAL_CRASH,
-        ) or any(kw in msg for kw in technical_kws):
+        ) or any(kw in msg for kw in technical_kws) or self._has_login_issue_signal(msg):
             targets.append(AgentType.TECHNICAL)
         if req.intent in (
             IntentCategory.BILLING,
@@ -1150,6 +1281,11 @@ class AgentOrchestrator:
         # 保持顺序去重，并只返回当前有实例的 Agent 类型。
         deduped = list(dict.fromkeys(targets))
         return [agent_type for agent_type in deduped if self._pool.get(agent_type)]
+
+    @staticmethod
+    def _has_login_issue_signal(message: str) -> bool:
+        """识别“登录 + 故障描述”这类未给出具体错误码的技术诉求。"""
+        return "登录" in message and any(signal in message for signal in ("错误", "异常", "提示", "排查"))
 
     @staticmethod
     def _needs_clarification(req: Request) -> bool:

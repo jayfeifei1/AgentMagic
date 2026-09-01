@@ -176,7 +176,6 @@ EchoMind 不只识别“咨询、投诉、技术、账单”这种粗粒度意�
 - `intent_group`
 - `intent_confidence`
 - `intent_source_scores`
-- `urgency`
 - `entities`
 
 这让意图识别不只是分类器，而是后续路由、澄清和升级的结构化输入层。

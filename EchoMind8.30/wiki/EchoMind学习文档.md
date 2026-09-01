@@ -30,7 +30,7 @@ EchoMind 是一个面向复杂客服任务的多 Agent 客服编排运行时。
 用户请求
   -> /chat
   -> MemoryManager 读取工作记忆、情景记忆、用户画像、摘要
-  -> IntentRecognizer 三路融合识别细粒度意图、紧急度、实体
+  -> IntentRecognizer 三路融合识别细粒度意图、实体
   -> 按意图决定是否触发知识库检索
   -> AgentOrchestrator 生成结构化路由决策
      - primary_agent
@@ -180,7 +180,6 @@ EchoMind 的意图识别不是单模型分类，而是三路融合：
 - `intent_group`
 - `confidence`
 - `source_scores`
-- `urgency`
 - `entities`
 
 #### 代码里是怎么做的
@@ -246,17 +245,6 @@ LLM 负责语义理解，Embedding 负责模板相似度，Pattern 负责即时�
 - 这些实体非常结构化，规则提取更稳
 - 不需要额外 LLM 成本
 - 后续路由和工具调用都能直接复用
-
-#### 紧急度
-
-紧急度分四级：
-
-- `LOW`
-- `MEDIUM`
-- `HIGH`
-- `CRITICAL`
-
-它不只是展示字段，而是会影响是否升级、是否优先转人工、是否提高路由保守程度。
 
 ### 4.2 Agent 编排
 
@@ -791,4 +779,3 @@ EchoMind 的核心不是“会聊天”，而是把客服系统里最关键的�
 如果再压缩成一句面试话术，可以说：
 
 > 我做的是一个可观测、可评测、可降级的多 Agent 客服编排系统，把意图识别、路由、知识检索、记忆、Skills、监控和评测串成了完整闭环。
-

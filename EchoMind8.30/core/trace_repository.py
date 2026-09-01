@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class TraceRepository:
-    """Stores request, LLM-call, and tool-call traces without affecting chat availability."""
+    """Stores request, Agent-execution, LLM-call, and tool-call traces without affecting chat availability."""
 
     def __init__(self) -> None:
         self._pool: Optional[aiomysql.Pool] = None
@@ -97,7 +97,12 @@ class TraceRepository:
                         (request_id,),
                     )
                     tool_calls = await cursor.fetchall()
-            return self._build_trace(request_trace, llm_calls, tool_calls)
+                    await cursor.execute(
+                        "SELECT * FROM agent_execution_traces WHERE request_id = %s ORDER BY sequence_no, id",
+                        (request_id,),
+                    )
+                    agent_executions = await cursor.fetchall()
+            return self._build_trace(request_trace, llm_calls, tool_calls, agent_executions)
         except Exception as ex:
             logger.warning("读取请求 %s 的 MySQL Trace 失败: %s", request_id, ex)
             return None
@@ -159,6 +164,7 @@ class TraceRepository:
                 request_id VARCHAR(64) PRIMARY KEY,
                 created_at DATETIME(3) NOT NULL,
                 intent VARCHAR(64) NULL,
+                intent_decision JSON NULL,
                 primary_agent VARCHAR(32) NULL,
                 supporting_agents JSON NOT NULL,
                 tools_used JSON NOT NULL,
@@ -167,6 +173,8 @@ class TraceRepository:
                 routing_reason TEXT NOT NULL,
                 routing_confidence DECIMAL(8, 4) NOT NULL DEFAULT 0,
                 latency_ms DECIMAL(12, 1) NOT NULL DEFAULT 0,
+                composer_content MEDIUMTEXT NULL,
+                final_response MEDIUMTEXT NULL,
                 INDEX idx_request_traces_created_at (created_at),
                 INDEX idx_request_traces_agent_created (primary_agent, created_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
@@ -212,11 +220,43 @@ class TraceRepository:
                     REFERENCES request_traces(request_id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """,
+            """
+            CREATE TABLE IF NOT EXISTS agent_execution_traces (
+                id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                request_id VARCHAR(64) NOT NULL,
+                created_at DATETIME(3) NOT NULL,
+                sequence_no INT NOT NULL,
+                agent_type VARCHAR(32) NOT NULL,
+                status VARCHAR(16) NOT NULL,
+                success BOOLEAN NOT NULL,
+                latency_ms DECIMAL(12, 1) NOT NULL DEFAULT 0,
+                content_length INT NOT NULL DEFAULT 0,
+                content_preview TEXT NULL,
+                error_message TEXT NULL,
+                INDEX idx_agent_executions_request_sequence (request_id, sequence_no),
+                INDEX idx_agent_executions_agent_created (agent_type, created_at),
+                CONSTRAINT fk_agent_execution_request FOREIGN KEY (request_id)
+                    REFERENCES request_traces(request_id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
         )
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 for statement in statements:
                     await cursor.execute(statement)
+                await cursor.execute("SHOW COLUMNS FROM request_traces LIKE 'composer_content'")
+                if await cursor.fetchone() is None:
+                    await cursor.execute("ALTER TABLE request_traces ADD COLUMN composer_content MEDIUMTEXT NULL")
+                await cursor.execute("SHOW COLUMNS FROM request_traces LIKE 'final_response'")
+                if await cursor.fetchone() is None:
+                    await cursor.execute("ALTER TABLE request_traces ADD COLUMN final_response MEDIUMTEXT NULL")
+                await cursor.execute("SHOW COLUMNS FROM request_traces LIKE 'intent_decision'")
+                if await cursor.fetchone() is None:
+                    await cursor.execute("ALTER TABLE request_traces ADD COLUMN intent_decision JSON NULL AFTER intent")
+                await cursor.execute("SHOW COLUMNS FROM agent_execution_traces LIKE 'content_preview'")
+                content_column = await cursor.fetchone()
+                if content_column and content_column["Type"].lower() != "mediumtext":
+                    await cursor.execute("ALTER TABLE agent_execution_traces MODIFY COLUMN content_preview MEDIUMTEXT NULL")
             await conn.commit()
 
     async def _persist(self, trace: Dict[str, Any]) -> None:
@@ -224,32 +264,39 @@ class TraceRepository:
         created_at = self._parse_timestamp(trace.get("timestamp"))
         llm_calls = list(trace.get("llm_calls") or [])
         tool_calls = list(trace.get("tool_calls") or [])
+        agent_executions = list(trace.get("agent_executions") or [])
         async with self._pool.acquire() as conn:
             try:
                 async with conn.cursor() as cursor:
                     await cursor.execute(
                         """
                         INSERT INTO request_traces (
-                            request_id, created_at, intent, primary_agent, supporting_agents, tools_used,
-                            escalated, status, routing_reason, routing_confidence, latency_ms
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            request_id, created_at, intent, intent_decision, primary_agent, supporting_agents, tools_used,
+                            escalated, status, routing_reason, routing_confidence, latency_ms, composer_content,
+                            final_response
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON DUPLICATE KEY UPDATE
                             created_at=VALUES(created_at), intent=VALUES(intent),
+                            intent_decision=VALUES(intent_decision),
                             primary_agent=VALUES(primary_agent), supporting_agents=VALUES(supporting_agents),
                             tools_used=VALUES(tools_used), escalated=VALUES(escalated), status=VALUES(status),
                             routing_reason=VALUES(routing_reason), routing_confidence=VALUES(routing_confidence),
-                            latency_ms=VALUES(latency_ms)
+                            latency_ms=VALUES(latency_ms), composer_content=VALUES(composer_content),
+                            final_response=VALUES(final_response)
                         """,
                         (
-                            trace["request_id"], created_at, trace.get("intent"), trace.get("primary_agent"),
+                            trace["request_id"], created_at, trace.get("intent"),
+                            self._json(trace.get("intent_decision", {})), trace.get("primary_agent"),
                             self._json(trace.get("supporting_agents", [])), self._json(trace.get("tools_used", [])),
                             bool(trace.get("escalated")), trace.get("status", "success"),
                             trace.get("routing_reason", ""), float(trace.get("routing_confidence", 0)),
-                            float(trace.get("latency_ms", 0)),
+                            float(trace.get("latency_ms", 0)), trace.get("composer_content", ""),
+                            trace.get("final_response", ""),
                         ),
                     )
                     await cursor.execute("DELETE FROM llm_call_traces WHERE request_id = %s", (trace["request_id"],))
                     await cursor.execute("DELETE FROM tool_call_traces WHERE request_id = %s", (trace["request_id"],))
+                    await cursor.execute("DELETE FROM agent_execution_traces WHERE request_id = %s", (trace["request_id"],))
                     for item in llm_calls:
                         await cursor.execute(
                             """
@@ -281,6 +328,22 @@ class TraceRepository:
                                 item.get("result_summary"), bool(item.get("success")), item.get("result_success"),
                                 float(item.get("latency_ms", 0)), bool(item.get("cached")),
                                 bool(item.get("reranked")), item.get("error"),
+                            ),
+                        )
+                    for sequence_no, item in enumerate(agent_executions, start=1):
+                        await cursor.execute(
+                            """
+                            INSERT INTO agent_execution_traces (
+                                request_id, created_at, sequence_no, agent_type, status, success,
+                                latency_ms, content_length, content_preview, error_message
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                trace["request_id"], self._parse_timestamp(item.get("timestamp"), created_at),
+                                sequence_no, item.get("agent_type", "unknown"), item.get("status", "success"),
+                                bool(item.get("success")), float(item.get("latency_ms", 0)),
+                                int(item.get("content_length", 0)), item.get("content_preview", ""),
+                                item.get("error", ""),
                             ),
                         )
                 await conn.commit()
@@ -317,11 +380,13 @@ class TraceRepository:
         request_trace: Dict[str, Any],
         llm_calls: List[Dict[str, Any]],
         tool_calls: List[Dict[str, Any]],
+        agent_executions: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         return {
             "request_id": request_trace["request_id"],
             "timestamp": request_trace["created_at"].isoformat(),
             "intent": request_trace["intent"],
+            "intent_decision": self._load_json(request_trace.get("intent_decision"), {}),
             "primary_agent": request_trace["primary_agent"],
             "supporting_agents": self._load_json(request_trace["supporting_agents"], []),
             "tools_used": self._load_json(request_trace["tools_used"], []),
@@ -330,6 +395,8 @@ class TraceRepository:
             "routing_reason": request_trace["routing_reason"],
             "routing_confidence": float(request_trace["routing_confidence"]),
             "latency_ms": float(request_trace["latency_ms"]),
+            "composer_content": request_trace.get("composer_content") or "",
+            "final_response": request_trace.get("final_response") or "",
             "llm_calls": [
                 {
                     "agent_type": item["agent_type"], "round_no": item["round_no"],
@@ -338,6 +405,16 @@ class TraceRepository:
                     "error": item["error_message"], "timestamp": item["created_at"].isoformat(),
                 }
                 for item in llm_calls
+            ],
+            "agent_executions": [
+                {
+                    "agent_type": item["agent_type"], "status": item["status"],
+                    "success": bool(item["success"]), "latency_ms": float(item["latency_ms"]),
+                    "content_length": int(item["content_length"]),
+                    "content_preview": item["content_preview"] or "",
+                    "error": item["error_message"] or "", "timestamp": item["created_at"].isoformat(),
+                }
+                for item in agent_executions
             ],
             "tool_calls": [
                 {

@@ -154,6 +154,9 @@ async function requestJson(baseUrl, path, options = {}) {
     data = text
   }
   if (!response.ok) {
+    if (response.status === 504) {
+      throw new Error('请求处理超时，系统可能仍在后台生成结果。请稍后重试或刷新页面查看最新记录。')
+    }
     const detail = typeof data === 'string' ? data : JSON.stringify(data)
     throw new Error(`${response.status} ${response.statusText}: ${detail}`)
   }

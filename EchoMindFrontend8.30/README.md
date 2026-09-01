@@ -18,13 +18,13 @@
 
 | 后端 | 默认地址 |
 |------|----------|
-| Python | `http://localhost:8000` |
+| Python | `http://localhost:8100` |
 
 开发模式下，Vite 会代理：
 
 | 前端路径 | 代理到 |
 |----------|--------|
-| `/api/python` | `http://localhost:8000` |
+| `/api/python` | `http://localhost:8100` |
 
 Docker 模式下，Nginx 会通过 `host.docker.internal` 访问宿主机上的 Python 服务。
 
@@ -51,7 +51,7 @@ http://localhost:5173
 如果后端端口不是默认值，可以启动时覆盖：
 
 ```bash
-VITE_PYTHON_API_URL=http://localhost:8000 \
+VITE_PYTHON_API_URL=http://localhost:8100 \
 npm run dev
 ```
 
@@ -86,5 +86,5 @@ docker compose down
 Python 后端默认：
 
 ```text
-http://localhost:8000
+http://localhost:8100
 ```

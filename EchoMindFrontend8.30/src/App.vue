@@ -32,8 +32,13 @@
           <p>发送一条真实请求，查看它如何识别意图、选择 Agent 并生成回复。</p>
         </div>
         <div class="heading-actions">
-          <span class="session-label">{{ settings.conversationId || '新会话' }}</span>
-          <button class="quiet-button" @click="clearConversation">清空</button>
+          <div class="conversation-badge" :title="settings.conversationId || '发送第一条消息后自动生成'">
+            <span>当前会话</span>
+            <strong>{{ conversationLabel }}</strong>
+          </div>
+          <button class="new-conversation-button" :disabled="busy" @click="startNewConversation">
+            <span aria-hidden="true">＋</span> 新建对话
+          </button>
         </div>
       </div>
 
@@ -151,11 +156,12 @@
 
               <label>
                 <span>用户 ID</span>
-                <input v-model="settings.userId" @change="persist" placeholder="u1001" />
+              <input v-model.trim="settings.userId" @input="persist" autocomplete="off" placeholder="u1001" />
+              <small class="field-hint">可直接修改，将作为订单、退款等演示数据的查询用户。</small>
               </label>
               <label>
                 <span>会话 ID</span>
-                <input v-model="settings.conversationId" @change="persist" placeholder="自动生成" />
+              <input v-model.trim="settings.conversationId" @input="persist" autocomplete="off" placeholder="自动生成" />
               </label>
               <div class="side-actions">
                 <button @click="checkHealth">检查连接</button>
@@ -388,6 +394,10 @@ let sidebarObserver
 const currentBackend = computed(() => backendMeta(settings.backend, settings))
 const docsUrl = computed(() => `${currentBackend.value.baseUrl}/docs`)
 const userInitial = computed(() => (settings.userId || 'U').slice(0, 1).toUpperCase())
+const conversationLabel = computed(() => {
+  const id = settings.conversationId
+  return id ? `#${id.slice(0, 8)}` : '待创建'
+})
 const activeAlerts = computed(() => monitorData.value.active_alerts || [])
 const agentCount = computed(() => Object.keys(monitorData.value.agent_stats || {}).length)
 const totalRequests = computed(() => Object.values(monitorData.value.agent_stats || {}).reduce((sum, item) => sum + Number(item.total || 0), 0))
@@ -545,13 +555,15 @@ function llmAgentLabel(agentType) {
   return labels[agentType] || agentType || 'Agent'
 }
 
-function clearConversation() {
+function startNewConversation() {
+  if (busy.value) return
   messages.value = []
   lastResponse.value = null
   lastTrace.value = null
   settings.conversationId = ''
   persist()
   persistConversation()
+  showToast('已切换到新对话，发送消息后会自动生成会话 ID')
 }
 
 async function searchKnowledge() {
