@@ -15,6 +15,7 @@ import hashlib
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -22,6 +23,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 import chromadb
+import httpx
 import redis.asyncio as redis
 from anthropic import AsyncAnthropic
 
@@ -85,6 +87,7 @@ class MemoryManager:
     HISTORY_TOP_K = 5     # 情景记忆检索返回条数
     SUMMARY_MAX_CHARS = 800
     PROFILE_DOC_PREFIX = "user_profile:"
+    EPISODIC_COLLECTION = "episodic_bge_v1"
 
     def __init__(
         self,
@@ -101,6 +104,10 @@ class MemoryManager:
             kwargs["base_url"] = base_url
         self._client = AsyncAnthropic(**kwargs)
         self._model  = model
+        self._embedding_url = os.getenv("ECHOMIND_EMBEDDING_URL", "http://embedding:8080/embed").rstrip("/")
+        self._embedding_timeout_s = float(os.getenv("ECHOMIND_EMBEDDING_TIMEOUT_S", "5"))
+        self._embedding_dimensions: Optional[int] = None
+        self._embedding_model = ""
 
         self._redis = redis.from_url(redis_url, decode_responses=True)
 
@@ -121,10 +128,28 @@ class MemoryManager:
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
 
-        # 情景记忆：存储历史对话片段
-        self._episodic = chroma.get_or_create_collection("episodic")
+        # 情景记忆显式使用本地 BGE 向量。新集合避免与旧默认向量维度混写。
+        self._episodic = chroma.get_or_create_collection(
+            self.EPISODIC_COLLECTION,
+            metadata={"hnsw:space": "cosine"},
+        )
+        try:
+            self._legacy_episodic = chroma.get_collection("episodic")
+        except Exception:
+            self._legacy_episodic = None
         # 用户画像：存储提炼出的偏好和实体
         self._profile  = chroma.get_or_create_collection("user_profile")
+
+    async def initialize(self) -> None:
+        """验证本地 Embedding 服务，并将旧默认向量摘要迁移到 BGE 集合。"""
+        await self._embed_texts(["EchoMind 情景记忆向量服务健康检查"])
+        logger.info(
+            "情景记忆 Embedding 已就绪: model=%s, dimensions=%s, collection=%s",
+            self._embedding_model or "unknown",
+            self._embedding_dimensions,
+            self.EPISODIC_COLLECTION,
+        )
+        await self._migrate_legacy_episodic()
 
     # ── 写入 ──────────────────────────────────────────────────────────────────
 
@@ -201,7 +226,7 @@ class MemoryManager:
             except Exception:
                 pass
 
-            # 直接传 documents，让 ChromaDB 内置模型生成 embedding（不依赖 Voyage API）
+            # 用户画像目前按固定 user_id 读取，沿用已有 collection 的默认 embedding。
             await asyncio.to_thread(
                 self._profile.add,
                 ids=[doc_id],
@@ -317,7 +342,7 @@ class MemoryManager:
         return msgs
 
     async def _search_episodic(self, user_id: str, conv_id: str, query: str) -> List[str]:
-        """语义检索情景记忆。ChromaDB 内置 embedding，不依赖外部 API。"""
+        """用本地 BGE 向量检索情景记忆。"""
         query_text = self._safe_text(query).strip()
         if not query_text:
             return []
@@ -346,18 +371,20 @@ class MemoryManager:
             return []
 
     async def _store_episodic(self, user_id: str, conv_id: str, text: str, summary: str) -> None:
-        """将压缩后的对话片段存入情景记忆。ChromaDB 内置 embedding，不依赖外部 API。"""
+        """将压缩后的对话摘要和本地 BGE 向量写入情景记忆。"""
         try:
             user_id = self._safe_text(user_id)
             conv_id = self._safe_text(conv_id)
             text = self._safe_text(text)
             summary = self._safe_text(summary)
             doc_id = hashlib.md5(f"{user_id}{conv_id}{time.time()}".encode()).hexdigest()
-            # 直接传 documents，ChromaDB 内置模型自动生成 embedding
+            # 显式传入本地 BGE 向量，避免 ChromaDB 默认 Embedding Function 介入。
+            embedding = (await self._embed_texts([summary]))[0]
             await asyncio.to_thread(
                 self._episodic.add,
                 ids=[doc_id],
                 documents=[summary],
+                embeddings=[embedding],
                 metadatas=[{"user_id": user_id, "conv_id": conv_id,
                             "ts": datetime.now().isoformat(), "full_text": self._safe_text(text[:500])}],
             )
@@ -420,12 +447,78 @@ class MemoryManager:
         n_results: int,
         where: Dict[str, Any],
     ) -> Dict[str, Any]:
+        query_embedding = (await self._embed_texts([query_text]))[0]
         return await asyncio.to_thread(
             self._episodic.query,
-            query_texts=[query_text],
+            query_embeddings=[query_embedding],
             n_results=n_results,
             where=where,
+            include=["documents"],
         )
+
+    async def _embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """调用已部署的 BGE 服务，并校验返回向量维度一致。"""
+        cleaned = [self._safe_text(text) for text in texts]
+        if not cleaned:
+            return []
+        async with httpx.AsyncClient(timeout=self._embedding_timeout_s) as client:
+            response = await client.post(self._embedding_url, json={"texts": cleaned})
+            response.raise_for_status()
+            payload = response.json()
+
+        vectors = payload.get("vectors")
+        if not isinstance(vectors, list) or len(vectors) != len(cleaned):
+            raise ValueError("Embedding 服务返回的向量数量不正确")
+        normalized = [[float(value) for value in vector] for vector in vectors]
+        if not normalized or not normalized[0]:
+            raise ValueError("Embedding 服务返回空向量")
+        dimensions = len(normalized[0])
+        if any(len(vector) != dimensions for vector in normalized):
+            raise ValueError("Embedding 服务返回的向量维度不一致")
+        if self._embedding_dimensions is not None and dimensions != self._embedding_dimensions:
+            raise ValueError(
+                f"Embedding 向量维度变化: {self._embedding_dimensions} -> {dimensions}"
+            )
+        self._embedding_dimensions = dimensions
+        self._embedding_model = str(payload.get("model") or self._embedding_model)
+        return normalized
+
+    async def _migrate_legacy_episodic(self) -> None:
+        """一次性迁移旧 episodic 的摘要，保留已有历史记忆但统一改用 BGE 向量。"""
+        if self._legacy_episodic is None or await asyncio.to_thread(self._legacy_episodic.count) == 0:
+            return
+        legacy = await asyncio.to_thread(
+            self._legacy_episodic.get,
+            include=["documents", "metadatas"],
+        )
+        ids = legacy.get("ids") or []
+        documents = legacy.get("documents") or []
+        metadatas = legacy.get("metadatas") or []
+        entries = [
+            (doc_id, document, metadata if isinstance(metadata, dict) else {})
+            for doc_id, document, metadata in zip(ids, documents, metadatas)
+            if isinstance(doc_id, str) and isinstance(document, str) and document.strip()
+        ]
+        if not entries:
+            return
+
+        existing = await asyncio.to_thread(self._episodic.get, ids=[entry[0] for entry in entries])
+        existing_ids = set(existing.get("ids") or [])
+        pending = [entry for entry in entries if entry[0] not in existing_ids]
+        if not pending:
+            return
+
+        for start in range(0, len(pending), 64):
+            batch = pending[start:start + 64]
+            vectors = await self._embed_texts([entry[1] for entry in batch])
+            await asyncio.to_thread(
+                self._episodic.add,
+                ids=[entry[0] for entry in batch],
+                documents=[entry[1] for entry in batch],
+                embeddings=vectors,
+                metadatas=[entry[2] for entry in batch],
+            )
+        logger.info("已迁移 %s 条旧情景记忆到 %s", len(pending), self.EPISODIC_COLLECTION)
 
     @staticmethod
     def _extract_docs(results: Dict[str, Any]) -> List[str]:

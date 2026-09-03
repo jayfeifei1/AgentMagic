@@ -23,3 +23,30 @@ def test_episodic_search_uses_chroma_and_filter_for_session_scope():
         ]
     }
     assert calls[1] == {"user_id": "u-p3"}
+
+
+def test_episodic_query_uses_local_bge_vector():
+    manager = object.__new__(MemoryManager)
+    calls = []
+
+    class Collection:
+        def query(self, **kwargs):
+            calls.append(kwargs)
+            return {"documents": [["退款历史摘要"]]}
+
+    async def embed_texts(texts):
+        assert texts == ["退款进度"]
+        return [[0.1, 0.2, 0.3]]
+
+    manager._episodic = Collection()
+    manager._embed_texts = embed_texts
+
+    result = asyncio.run(manager._query_episodic("退款进度", 5, {"user_id": "u-p3"}))
+
+    assert result == {"documents": [["退款历史摘要"]]}
+    assert calls == [{
+        "query_embeddings": [[0.1, 0.2, 0.3]],
+        "n_results": 5,
+        "where": {"user_id": "u-p3"},
+        "include": ["documents"],
+    }]
