@@ -1,9 +1,9 @@
 <template>
   <main :class="['app-shell', `app-shell-${activeView}`]">
     <header class="topbar">
-      <a class="brand" href="#" aria-label="EchoMind 首页" @click.prevent="activeView = 'chat'">
+      <a class="brand" href="#" aria-label="协同平台首页" @click.prevent="activeView = 'chat'">
         <span class="brand-mark">E</span>
-        <span class="brand-name">EchoMind</span>
+        <span class="brand-name">协同平台</span>
       </a>
 
       <nav class="view-nav" aria-label="工作区">
@@ -28,7 +28,7 @@
       <div class="page-heading">
         <div class="heading-copy">
           <span class="kicker">Conversation lab</span>
-          <h1>和客服 Agent 对话</h1>
+          <h1>和 Agent 对话</h1>
           <p>发送一条真实请求，查看它如何识别意图、选择 Agent 并生成回复。</p>
         </div>
         <div class="heading-actions">
@@ -312,7 +312,7 @@
         <div class="heading-copy">
           <span class="kicker">Evaluation lab</span>
           <h1>评测 Agent</h1>
-          <p>运行 FastAPI 内置评测，查看意图识别、对话质量和回归结果。</p>
+          <p>运行内置评测，查看意图识别、复合问题路由、对话质量和回归结果。</p>
         </div>
         <button @click="runEvaluation" :disabled="busy">{{ busy ? '运行中...' : '运行评测' }}</button>
       </div>
@@ -328,7 +328,7 @@
           <section class="workspace-card">
             <div class="card-heading"><div><span class="kicker">Scores</span><h2>平均评分</h2></div></div>
             <div class="score-list">
-              <div v-for="(value, key) in evalData.avg_scores" :key="key"><span>{{ key }}</span><i><b :style="{ width: `${Math.min(Number(value) * 10, 100)}%` }"></b></i><strong>{{ Number(value).toFixed(2) }}</strong></div>
+              <div v-for="(value, key) in evalData.avg_scores" :key="key"><span>{{ key }}</span><i><b :style="{ width: `${Math.min(Number(value) * 100, 100)}%` }"></b></i><strong>{{ Number(value).toFixed(2) }}</strong></div>
             </div>
           </section>
           <section class="workspace-card">
@@ -363,10 +363,12 @@ import {
 } from './lib/backends'
 
 const CONVERSATION_STORAGE_KEY = 'echomind.frontend.conversation'
+const EVALUATION_STORAGE_KEY = 'echomind.frontend.evaluation'
+const ACTIVE_VIEW_STORAGE_KEY = 'echomind.frontend.active-view'
 
 const settings = reactive(createInitialSettings())
 const restoredConversation = readConversation()
-const activeView = ref('chat')
+const activeView = ref(readActiveView())
 const messages = ref(restoredConversation.messages)
 const draft = ref('')
 const busy = ref(false)
@@ -385,7 +387,7 @@ const monitorData = ref({ agent_stats: {}, tool_stats: {}, active_alerts: [], su
 const skillsData = ref({ count: 0, skills: [], errors: [] })
 const lastResponse = ref(restoredConversation.lastResponse)
 const lastTrace = ref(restoredConversation.lastTrace)
-const evalData = ref(null)
+const evalData = ref(readEvaluation())
 const toast = ref('')
 let toastTimer
 let messageSequence = messages.value.length
@@ -404,6 +406,8 @@ const totalRequests = computed(() => Object.values(monitorData.value.agent_stats
 
 watch(() => settings.conversationId, persist)
 watch([messages, lastResponse, lastTrace], persistConversation, { deep: true })
+watch(activeView, persistActiveView)
+watch(evalData, persistEvaluation, { deep: true })
 onMounted(() => {
   refreshConsole()
   updateSidebarHeight()
@@ -420,6 +424,41 @@ onBeforeUnmount(() => {
 })
 
 function persist() { saveSettings(settings) }
+
+function readActiveView() {
+  try {
+    const view = localStorage.getItem(ACTIVE_VIEW_STORAGE_KEY)
+    return ['chat', 'knowledge', 'evaluation'].includes(view) ? view : 'chat'
+  } catch {
+    return 'chat'
+  }
+}
+
+function persistActiveView() {
+  try {
+    localStorage.setItem(ACTIVE_VIEW_STORAGE_KEY, activeView.value)
+  } catch {
+    // 浏览器禁用本地存储时仍可正常切换页面。
+  }
+}
+
+function readEvaluation() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(EVALUATION_STORAGE_KEY) || 'null')
+    return stored && typeof stored === 'object' && typeof stored.total === 'number' ? stored : null
+  } catch {
+    return null
+  }
+}
+
+function persistEvaluation() {
+  try {
+    if (evalData.value) localStorage.setItem(EVALUATION_STORAGE_KEY, JSON.stringify(evalData.value))
+    else localStorage.removeItem(EVALUATION_STORAGE_KEY)
+  } catch {
+    // 浏览器存储空间不足时，保留当前页面中的评测报告。
+  }
+}
 
 function readConversation() {
   try {

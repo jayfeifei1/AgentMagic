@@ -511,6 +511,7 @@ class EvalDialogInput(BaseModel):
     turns: Optional[List[str]] = None
     user_id: Optional[str] = None
     conv_id: Optional[str] = None
+    expected_agent_types: Optional[List[str]] = None
 
 
 class EvalRunInput(BaseModel):

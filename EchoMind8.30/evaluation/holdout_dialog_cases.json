@@ -1,0 +1,49 @@
+{
+  "intent_cases": [],
+  "dialog_cases": [
+    {
+      "question": "订单 ORD-HOLDOUT-9001 显示已签收，但我没有收到商品，应该怎么处理？",
+      "user_id": "eval_holdout"
+    },
+    {
+      "question": "银行卡已经扣款成功，但页面提示订单创建失败，我现在应该先做什么？",
+      "user_id": "eval_holdout"
+    },
+    {
+      "question": "Android 更新后商品详情页一直白屏，重启和重装都没有改善，怎么排查？",
+      "user_id": "eval_holdout"
+    },
+    {
+      "question": "我不记得订单号，但想退还尚未发货的商品，需要准备哪些信息？",
+      "user_id": "eval_holdout"
+    },
+    {
+      "question": "账号里出现了不是我填写的收货地址，我该如何保护账号？",
+      "user_id": "eval_holdout"
+    },
+    {
+      "turns": [
+        "我需要开一张电子发票。",
+        "订单号暂时找不到。",
+        "没有订单号还能提交开票申请吗？"
+      ],
+      "user_id": "eval_holdout",
+      "conv_id": "eval_holdout_invoice"
+    },
+    {
+      "question": "登录时提示 401，同时付款成功后订单没有生成，请把登录和支付问题一起排查。",
+      "user_id": "eval_holdout",
+      "expected_agent_types": ["technical", "billing"]
+    },
+    {
+      "question": "提交订单时返回 500，而且同一笔支付被扣了两次，请同时排查技术和账单问题。",
+      "user_id": "eval_holdout",
+      "expected_agent_types": ["technical", "billing"]
+    },
+    {
+      "question": "登录页面反复报错，同时我想申请退款但没有订单号，请分别协助技术排查和售后处理。",
+      "user_id": "eval_holdout",
+      "expected_agent_types": ["technical", "billing"]
+    }
+  ]
+}

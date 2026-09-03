@@ -279,7 +279,7 @@ a { color: inherit; }
 }
 
 .page-chat .page-heading h1 {
-  font-size: clamp(28px, 2.2vw, 36px);
+  font-size: clamp(24px, 1.9vw, 30px);
 }
 
 .page-chat .page-heading p {

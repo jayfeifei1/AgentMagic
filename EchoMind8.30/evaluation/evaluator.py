@@ -262,6 +262,7 @@ class EndToEndEvaluator:
         all_scores: Dict[str, List[float]] = {
             "relevance": [], "accuracy": [], "completeness": [], "helpfulness": []
         }
+        routing_checks: List[bool] = []
 
         # 1. 意图识别评测
         intent_metrics: Dict[str, Any] = {}
@@ -289,6 +290,8 @@ class EndToEndEvaluator:
                     for k in all_scores:
                         if k in r.scores:
                             all_scores[k].append(r.scores[k])
+                    if r.metadata.get("expected_agent_types"):
+                        routing_checks.append(bool(r.metadata.get("routing_pass")))
 
         # 3. 汇总
         avg_scores = {
@@ -296,6 +299,8 @@ class EndToEndEvaluator:
         }
         if intent_metrics:
             avg_scores["intent_accuracy"] = intent_metrics["accuracy"]
+        if routing_checks:
+            avg_scores["routing_accuracy"] = round(statistics.mean(routing_checks), 4)
 
         passed_count = sum(1 for r in results if r.passed)
         pass_rate    = passed_count / len(results) if results else 0.0
@@ -346,7 +351,10 @@ class EndToEndEvaluator:
             actual_answer = orch_result.response
 
             scores = await self._judge.judge(question, actual_answer, context=context or None)
-            passed = scores.overall >= self.PASS_THRESHOLD
+            expected_agents = [str(agent) for agent in case.get("expected_agent_types", [])]
+            actual_agents = [agent.value for agent in orch_result.agent_types]
+            routing_pass = not expected_agents or set(expected_agents) == set(actual_agents)
+            passed = scores.overall >= self.PASS_THRESHOLD and routing_pass
 
             history.append({"role": "user", "content": question})
             history.append({"role": "assistant", "content": actual_answer})
@@ -362,7 +370,10 @@ class EndToEndEvaluator:
                     "helpfulness": scores.helpfulness,
                     "overall": scores.overall,
                 },
-                detail=f"Q: {question[:30]}... → 综合评分 {scores.overall:.3f}",
+                detail=(
+                    f"Q: {question[:30]}... → 综合评分 {scores.overall:.3f}"
+                    + ("，路由通过" if routing_pass else f"，路由不符（期望 {expected_agents}，实际 {actual_agents}）")
+                ),
                 metadata={
                     "question": question,
                     "response": actual_answer,
@@ -372,6 +383,9 @@ class EndToEndEvaluator:
                     "conv_id": conv_id,
                     "judge_failed": scores.judge_failed,
                     "judge_error": scores.error,
+                    "expected_agent_types": expected_agents,
+                    "actual_agent_types": actual_agents,
+                    "routing_pass": routing_pass,
                 },
             ))
 
@@ -416,6 +430,8 @@ class EndToEndEvaluator:
         recs = []
         if scores.get("intent_accuracy", 1.0) < 0.90:
             recs.append("意图识别准确率 < 90%：增加 Few-shot 示例，或对低 F1 的意图类别补充训练数据")
+        if scores.get("routing_accuracy", 1.0) < 0.90:
+            recs.append("复合问题路由准确率偏低：检查领域关键词与主辅 Agent 路由规则")
         if scores.get("relevance", 1.0) < 0.75:
             recs.append("相关性偏低：检查 Agent system_prompt，确保 Agent 聚焦于用户问题")
         if scores.get("completeness", 1.0) < 0.75:
@@ -479,17 +495,43 @@ class EndToEndEvaluator:
 # ── 内置测试用例（开箱即用）──────────────────────────────────────────────────
 
 DEFAULT_INTENT_CASES: List[IntentTestCase] = [
-    IntentTestCase("我的订单什么时候到？",       "logistics"),
-    IntentTestCase("帮我取消订单",               "request"),
-    IntentTestCase("你们服务太差了！",            "complaint"),
-    IntentTestCase("应用一直报500错误",           "technical_crash"),
-    IntentTestCase("为什么扣了两次款？",          "payment_issue"),
-    IntentTestCase("我要投诉，转人工！",          "human_handoff"),
-    IntentTestCase("你好",                        "greeting"),
-    IntentTestCase("修改我的邮箱地址",            "account"),
-    IntentTestCase("帮我开发票",                  "invoice"),
-    IntentTestCase("退款多久到账？",              "refund"),
-    IntentTestCase("登录一直报401",               "technical_login"),
+    # 单意图：每个已路由意图至少两条不同表达，避免只命中模板措辞。
+    IntentTestCase("平台客服服务时间是什么？", "query"),
+    IntentTestCase("这个平台支持哪些服务？", "query"),
+    IntentTestCase("你们服务太差了！", "complaint"),
+    IntentTestCase("等了两天还没人处理，我很不满意。", "complaint"),
+    IntentTestCase("帮我取消订单", "request"),
+    IntentTestCase("请协助我修改收货信息。", "request"),
+    IntentTestCase("你好", "greeting"),
+    IntentTestCase("在吗，想咨询一个问题。", "greeting"),
+    IntentTestCase("请升级到高级客服处理。", "escalation"),
+    IntentTestCase("我要联系负责部门继续处理。", "escalation"),
+    IntentTestCase("系统页面一直加载不出来。", "technical"),
+    IntentTestCase("功能按钮点击后没有任何反应。", "technical"),
+    IntentTestCase("我想查看本月账单明细。", "billing"),
+    IntentTestCase("消费记录在哪里可以查看？", "billing"),
+    IntentTestCase("怎么修改个人资料？", "account"),
+    IntentTestCase("修改我的邮箱地址", "account"),
+    IntentTestCase("服务处理很快，谢谢！", "feedback"),
+    IntentTestCase("这次售后体验很好，给好评。", "feedback"),
+    IntentTestCase("我的订单现在是什么状态？", "order_status"),
+    IntentTestCase("订单 ORD-DEMO-1004 有没有发货？", "order_status"),
+    IntentTestCase("我的订单什么时候到？", "logistics"),
+    IntentTestCase("物流三天没有更新，帮我查一下。", "logistics"),
+    IntentTestCase("我要申请退款", "refund"),
+    IntentTestCase("退款多久到账？", "refund"),
+    IntentTestCase("帮我开发票", "invoice"),
+    IntentTestCase("电子发票在哪里下载？", "invoice"),
+    IntentTestCase("为什么扣了两次款？", "payment_issue"),
+    IntentTestCase("支付成功但订单页面没有显示。", "payment_issue"),
+    IntentTestCase("发现不是我本人操作的登录记录。", "account_security"),
+    IntentTestCase("账户疑似被盗，请帮我保护账号。", "account_security"),
+    IntentTestCase("登录一直报401", "technical_login"),
+    IntentTestCase("输入密码后提示认证失败，无法登录。", "technical_login"),
+    IntentTestCase("应用一直报500错误", "technical_crash"),
+    IntentTestCase("提交订单时页面闪退。", "technical_crash"),
+    IntentTestCase("我要投诉，转人工！", "human_handoff"),
+    IntentTestCase("这个问题请直接转人工客服。", "human_handoff"),
 ]
 
 DEFAULT_DIALOG_CASES: List[Dict[str, Any]] = [
@@ -498,4 +540,20 @@ DEFAULT_DIALOG_CASES: List[Dict[str, Any]] = [
     {"question": "为什么这个月多扣了 50 块钱？"},
     {"question": "帮我把收货地址改成北京市朝阳区"},
     {"turns": ["你好，我想退款", "订单号是 #12345", "退款多久能到账？"]},
+    # 复合问题：除了 Judge 质量分，还校验技术、账单 Agent 是否同时参与。
+    {
+        "question": "登录后台提示 401，同时订单 ORD-DEMO-1002 的退款进度想查询，请分别排查。",
+        "user_id": "u1001",
+        "expected_agent_types": ["technical", "billing"],
+    },
+    {
+        "question": "应用报 500 错误，而且订单 ORD-DEMO-1001 被重复扣款，请同时排查技术和账单。",
+        "user_id": "u1001",
+        "expected_agent_types": ["technical", "billing"],
+    },
+    {
+        "question": "登录时总提示错误，同时我想给订单 ORD-DEMO-1004 开电子发票，请分别处理。",
+        "user_id": "u1001",
+        "expected_agent_types": ["technical", "billing"],
+    },
 ]
