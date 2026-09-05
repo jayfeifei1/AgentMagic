@@ -2,8 +2,8 @@
 RAG 知识库 —— 基于 ChromaDB 的真实检索实现。
 
 功能：
-  1. 文档导入：将文本切片后存入 ChromaDB（自动生成 Embedding）
-  2. 语义检索：根据 query 从知识库中检索最相关的文档片段
+  1. 文档导入：将文本切片后，用本地 BGE 服务生成向量并存入 ChromaDB
+  2. 语义检索：用同一个 BGE 服务向量化 query，召回相关文档片段
   3. 与 MCP 工具框架集成：作为 knowledge_search 工具的真实 handler
 
 ChromaDB 在这里的角色：
@@ -14,9 +14,12 @@ ChromaDB 在这里的角色：
 import asyncio
 import hashlib
 import logging
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import chromadb
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -25,21 +28,40 @@ class KnowledgeBase:
     """
     基于 ChromaDB 的 RAG 知识库。
 
-    ChromaDB 内置了 Embedding 模型（all-MiniLM-L6-v2），
-    调用 add() 时自动生成向量，query() 时自动做语义匹配。
-    不需要额外调用 Anthropic Embeddings API。
+    文档与查询均使用已部署的 BAAI/bge-small-zh-v1.5 服务向量化，
+    再由 ChromaDB 进行余弦相似度检索。
     """
 
-    COLLECTION_NAME = "knowledge_base"
+    COLLECTION_NAME = "knowledge_base_bge_v1"
+    LEGACY_COLLECTION_NAME = "knowledge_base"
+    EMBEDDING_BATCH_SIZE = 64
+    SEED_SOURCE = "echomind_default_seed_v1"
+    LEGACY_DEFAULT_TITLES = {
+        "退款政策", "订单查询", "账户安全", "技术故障排查", "会员与积分", "配送说明",
+    }
 
     def __init__(
         self,
         chroma_host: str = "localhost",
         chroma_port: int = 8000,
         chroma_path: str = "./data/chroma",
+        embedding_url: Optional[str] = None,
+        embedding_timeout_s: Optional[float] = None,
+        seed_dir: Optional[str] = None,
     ):
-        # 优先连接独立 ChromaDB 服务（服务端内置 embedding 模型，客户端无需下载）
-        self._use_server = False
+        self._embedding_url = (
+            embedding_url or os.getenv("ECHOMIND_EMBEDDING_URL", "http://embedding:8080/embed")
+        ).rstrip("/")
+        self._embedding_timeout_s = embedding_timeout_s or float(
+            os.getenv("ECHOMIND_EMBEDDING_TIMEOUT_S", "5")
+        )
+        self._embedding_dimensions: Optional[int] = None
+        self._embedding_model = ""
+        self._seed_dir = Path(seed_dir) if seed_dir else (
+            Path(__file__).resolve().parents[1] / "data" / "knowledge" / "seed"
+        )
+
+        # 优先连接独立 ChromaDB 服务，连不上才使用本地嵌入式模式。
         try:
             # HttpClient 默认也会初始化 ChromaDB telemetry；显式关闭避免 posthog 兼容性错误日志。
             self._client = chromadb.HttpClient(
@@ -48,7 +70,6 @@ class KnowledgeBase:
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
             self._client.heartbeat()
-            self._use_server = True
             logger.info(f"知识库 ChromaDB 已连接: {chroma_host}:{chroma_port}")
         except Exception:
             logger.info(f"知识库 ChromaDB 服务不可用，使用本地模式: {chroma_path}")
@@ -57,16 +78,32 @@ class KnowledgeBase:
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
 
-        # 使用服务端时不传 embedding_function，让服务端处理
-        # 本地模式时也不传，使用 ChromaDB 默认的（会触发模型下载）
+        # 显式传入 BGE 向量，因此不会使用 ChromaDB 默认 MiniLM Embedding Function。
         self._collection = self._client.get_or_create_collection(
             name=self.COLLECTION_NAME,
-            metadata={"description": "EchoMind RAG 知识库"},
+            metadata={
+                "description": "EchoMind RAG 知识库（本地 BGE 向量）",
+                "hnsw:space": "cosine",
+                "embedding_model": "BAAI/bge-small-zh-v1.5",
+            },
         )
+        try:
+            self._legacy_collection = self._client.get_collection(self.LEGACY_COLLECTION_NAME)
+        except Exception:
+            self._legacy_collection = None
 
-        # 如果知识库为空，导入默认文档
-        if self._collection.count() == 0:
-            self._load_default_docs()
+    async def initialize(self) -> None:
+        """验证本地 BGE 服务，迁移自定义旧文档，并导入默认种子知识。"""
+        await asyncio.to_thread(self._embed_texts, ["EchoMind RAG 向量服务健康检查"])
+        logger.info(
+            "RAG Embedding 已就绪: model=%s, dimensions=%s, collection=%s",
+            self._embedding_model or "unknown",
+            self._embedding_dimensions,
+            self.COLLECTION_NAME,
+        )
+        await self._migrate_legacy_documents()
+        await self._remove_legacy_default_documents()
+        await self._load_seed_documents()
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
 
@@ -80,19 +117,32 @@ class KnowledgeBase:
         ids, docs, metas = [], [], []
 
         for doc in documents:
-            title   = doc.get("title", "")
+            title = doc.get("title", "")
             content = doc.get("content", "")
+            extra_metadata = doc.get("metadata", {})
+            if not isinstance(extra_metadata, dict):
+                extra_metadata = {}
             chunks  = self._chunk_text(content, chunk_size=500)
 
             for i, chunk in enumerate(chunks):
                 doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
                 ids.append(doc_id)
                 docs.append(chunk)
-                metas.append({"title": title, "chunk_index": i, "total_chunks": len(chunks)})
+                metas.append({
+                    "title": title,
+                    "chunk_index": i,
+                    "total_chunks": len(chunks),
+                    **extra_metadata,
+                })
 
         if ids:
-            # ChromaDB 会自动生成 Embedding
-            self._collection.add(ids=ids, documents=docs, metadatas=metas)
+            embeddings = self._embed_texts(docs)
+            self._collection.add(
+                ids=ids,
+                documents=docs,
+                embeddings=embeddings,
+                metadatas=metas,
+            )
             logger.info(f"知识库导入 {len(ids)} 个文档片段")
 
         return len(ids)
@@ -105,10 +155,13 @@ class KnowledgeBase:
         """
         语义检索：根据 query 返回最相关的文档片段。
 
-        ChromaDB 内部自动将 query 转为向量，与存储的文档向量做余弦相似度匹配。
+        使用本地 BGE 将 query 转为向量，与 BGE 文档向量做余弦相似度匹配。
         """
+        if not query.strip():
+            return []
+        query_embedding = self._embed_texts([query])[0]
         results = self._collection.query(
-            query_texts=[query],
+            query_embeddings=[query_embedding],
             n_results=top_k,
         )
 
@@ -183,78 +236,128 @@ class KnowledgeBase:
 
         return chunks
 
-    def _load_default_docs(self) -> None:
-        """导入默认知识库文档（客服场景常见问题）。"""
-        default_docs = [
-            {
-                "title": "退款政策",
-                "content": (
-                    "退款政策说明。"
-                    "用户在购买后 7 天内可以申请无理由退款。"
-                    "退款申请提交后，系统会在 1-3 个工作日内审核。"
-                    "审核通过后，款项将在 5-7 个工作日内退回原支付账户。"
-                    "如果商品已发货，需要先完成退货流程才能退款。"
-                    "退货运费由用户承担，除非是商品质量问题。"
-                    "超过 7 天但未超过 30 天的订单，需要提供商品质量问题的证据才能退款。"
-                ),
-            },
-            {
-                "title": "订单查询",
-                "content": (
-                    "订单查询指南。"
-                    "用户可以通过订单号查询订单状态。"
-                    "订单状态包括：待支付、已支付、已发货、运输中、已签收、已完成。"
-                    "如果订单显示已发货但超过 7 天未收到，可以联系客服申请查件。"
-                    "物流信息通常在发货后 24 小时内更新。"
-                    "如果订单显示异常，请提供订单号联系客服处理。"
-                ),
-            },
-            {
-                "title": "账户安全",
-                "content": (
-                    "账户安全说明。"
-                    "建议用户定期修改密码，密码长度至少 8 位，包含字母和数字。"
-                    "如果忘记密码，可以通过绑定的手机号或邮箱重置。"
-                    "发现账户异常登录时，系统会自动锁定账户并发送通知。"
-                    "用户可以在安全设置中开启两步验证，提高账户安全性。"
-                    "不要将密码分享给他人，客服人员不会索要用户密码。"
-                ),
-            },
-            {
-                "title": "技术故障排查",
-                "content": (
-                    "常见技术问题排查。"
-                    "应用崩溃：请尝试清除缓存后重启应用，如果问题持续请更新到最新版本。"
-                    "登录失败 401 错误：表示认证失败，请检查用户名密码是否正确，或尝试重置密码。"
-                    "页面加载慢：检查网络连接，尝试切换 WiFi 或移动数据。"
-                    "支付失败：确认银行卡余额充足，检查是否开启了网上支付功能。"
-                    "500 服务器错误：这是服务端问题，请稍后重试，如果持续出现请联系技术支持。"
-                ),
-            },
-            {
-                "title": "会员与积分",
-                "content": (
-                    "会员积分规则。"
-                    "每消费 1 元累积 1 积分。"
-                    "积分可以在下次购物时抵扣，100 积分 = 1 元。"
-                    "会员等级分为：普通会员、银卡会员（累计消费 1000 元）、金卡会员（累计消费 5000 元）。"
-                    "银卡会员享受 95 折优惠，金卡会员享受 9 折优惠。"
-                    "积分有效期为 1 年，过期自动清零。"
-                    "生日当月消费可获得双倍积分。"
-                ),
-            },
-            {
-                "title": "配送说明",
-                "content": (
-                    "配送服务说明。"
-                    "标准配送：3-5 个工作日送达，免运费（订单满 99 元）。"
-                    "加急配送：1-2 个工作日送达，运费 15 元。"
-                    "同城配送：当日达或次日达，运费 10 元。"
-                    "偏远地区可能需要额外 2-3 天。"
-                    "配送时间为每天 9:00-18:00，节假日可能延迟。"
-                    "如果需要修改收货地址，请在发货前联系客服。"
-                ),
-            },
+    def _read_seed_documents(self) -> List[Dict[str, Any]]:
+        """读取版本受控的默认 Markdown 知识，不再将业务规则写死在 Python 中。"""
+        if not self._seed_dir.exists():
+            logger.warning("默认知识目录不存在: %s", self._seed_dir)
+            return []
+        documents = []
+        for path in sorted(self._seed_dir.glob("*.md")):
+            content = path.read_text(encoding="utf-8").strip()
+            if not content:
+                continue
+            title = next(
+                (line.lstrip("#").strip() for line in content.splitlines() if line.startswith("# ")),
+                path.stem,
+            )
+            documents.append({
+                "title": title,
+                "content": content,
+                "metadata": {"source": self.SEED_SOURCE, "source_file": path.name},
+            })
+        return documents
+
+    async def _load_seed_documents(self) -> None:
+        """首次加载 data/knowledge/seed 下的默认知识。"""
+        existing = await asyncio.to_thread(
+            self._collection.get,
+            where={"source": self.SEED_SOURCE},
+            include=["metadatas"],
+        )
+        if existing.get("ids"):
+            return
+        documents = self._read_seed_documents()
+        if not documents:
+            return
+        await self.add_documents_async(documents)
+        logger.info("已从默认知识目录导入 %s 篇文档: %s", len(documents), self._seed_dir)
+
+    def _embed_texts(self, texts: List[str]) -> List[List[float]]:
+        """调用本地 BGE 服务，并校验向量数量与维度。"""
+        cleaned = [str(text or "").encode("utf-8", errors="ignore").decode("utf-8") for text in texts]
+        if not cleaned:
+            return []
+        with httpx.Client(timeout=self._embedding_timeout_s) as client:
+            response = client.post(self._embedding_url, json={"texts": cleaned})
+            response.raise_for_status()
+            payload = response.json()
+
+        vectors = payload.get("vectors")
+        if not isinstance(vectors, list) or len(vectors) != len(cleaned):
+            raise ValueError("Embedding 服务返回的向量数量不正确")
+        normalized = [[float(value) for value in vector] for vector in vectors]
+        if not normalized or not normalized[0]:
+            raise ValueError("Embedding 服务返回空向量")
+        dimensions = len(normalized[0])
+        if any(len(vector) != dimensions for vector in normalized):
+            raise ValueError("Embedding 服务返回的向量维度不一致")
+        if self._embedding_dimensions is not None and dimensions != self._embedding_dimensions:
+            raise ValueError(
+                f"Embedding 向量维度变化: {self._embedding_dimensions} -> {dimensions}"
+            )
+        self._embedding_dimensions = dimensions
+        self._embedding_model = str(payload.get("model") or self._embedding_model)
+        return normalized
+
+    async def _migrate_legacy_documents(self) -> None:
+        """将旧 MiniLM Collection 的原文档重新编码为 BGE 向量，写入新 Collection。"""
+        if self._legacy_collection is None:
+            return
+        legacy_count = await asyncio.to_thread(self._legacy_collection.count)
+        if legacy_count == 0:
+            return
+        legacy = await asyncio.to_thread(
+            self._legacy_collection.get,
+            include=["documents", "metadatas"],
+        )
+        entries = [
+            (doc_id, document, metadata if isinstance(metadata, dict) else {})
+            for doc_id, document, metadata in zip(
+                legacy.get("ids") or [],
+                legacy.get("documents") or [],
+                legacy.get("metadatas") or [],
+            )
+            if (
+                isinstance(doc_id, str)
+                and isinstance(document, str)
+                and document.strip()
+                and (
+                    not isinstance(metadata, dict)
+                    or metadata.get("title") not in self.LEGACY_DEFAULT_TITLES
+                )
+            )
         ]
-        self.add_documents(default_docs)
-        logger.info(f"已导入默认知识库: {len(default_docs)} 篇文档")
+        if not entries:
+            return
+
+        existing = await asyncio.to_thread(
+            self._collection.get,
+            ids=[entry[0] for entry in entries],
+        )
+        existing_ids = set(existing.get("ids") or [])
+        pending = [entry for entry in entries if entry[0] not in existing_ids]
+        for start in range(0, len(pending), self.EMBEDDING_BATCH_SIZE):
+            batch = pending[start:start + self.EMBEDDING_BATCH_SIZE]
+            vectors = await asyncio.to_thread(self._embed_texts, [entry[1] for entry in batch])
+            await asyncio.to_thread(
+                self._collection.add,
+                ids=[entry[0] for entry in batch],
+                documents=[entry[1] for entry in batch],
+                embeddings=vectors,
+                metadatas=[entry[2] for entry in batch],
+            )
+        if pending:
+            logger.info("已迁移 %s 个旧知识库片段到 %s", len(pending), self.COLLECTION_NAME)
+
+    async def _remove_legacy_default_documents(self) -> None:
+        """移除曾由 Python 写死的六篇演示文档，避免与新的 Markdown 种子重复。"""
+        existing = await asyncio.to_thread(self._collection.get, include=["metadatas"])
+        legacy_ids = [
+            doc_id
+            for doc_id, metadata in zip(existing.get("ids") or [], existing.get("metadatas") or [])
+            if isinstance(metadata, dict)
+            and metadata.get("title") in self.LEGACY_DEFAULT_TITLES
+        ]
+        if legacy_ids:
+            await asyncio.to_thread(self._collection.delete, ids=legacy_ids)
+            logger.info("已移除 %s 个旧默认知识片段", len(legacy_ids))

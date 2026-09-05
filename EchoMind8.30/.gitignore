@@ -11,7 +11,10 @@ venv/
 .env
 
 # 数据目录
-data/
+data/*
+!data/knowledge/
+!data/knowledge/seed/
+!data/knowledge/seed/*.md
 logs/
 
 # IDE
