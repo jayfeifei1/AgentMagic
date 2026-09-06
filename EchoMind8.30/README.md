@@ -62,6 +62,16 @@ docker compose up -d --build
 docker compose ps
 ```
 
+### Windows：启用 MinerU 文档下载 Relay
+
+Windows Docker Desktop 在部分网络下无法直接下载 MinerU CDN 的解析结果。上传 PDF、DOCX 或图片前，执行一次：
+
+```powershell
+.\tools\start_mineru_relay.ps1
+```
+
+Relay 仅监听 `127.0.0.1:18789`；容器通过 `host.docker.internal` 调用它。Relay 保持运行时，单独重启 Docker 容器不需要重复启动。
+
 看日志：
 
 ```bash

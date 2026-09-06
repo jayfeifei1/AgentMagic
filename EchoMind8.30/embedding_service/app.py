@@ -33,6 +33,10 @@ class EmbedRequest(BaseModel):
     texts: List[str] = Field(min_length=1, max_length=128)
 
 
+class TokenCountRequest(BaseModel):
+    texts: List[str] = Field(min_length=1, max_length=128)
+
+
 @app.get("/health")
 async def health():
     if embedding_model is None:
@@ -46,3 +50,14 @@ async def embed(request: EmbedRequest):
         raise HTTPException(status_code=503, detail="BGE 模型未就绪")
     vectors = await asyncio.to_thread(lambda: list(embedding_model.embed(request.texts)))
     return {"model": MODEL_NAME, "vectors": [vector.tolist() for vector in vectors]}
+
+
+@app.post("/token-count")
+async def token_count(request: TokenCountRequest):
+    """使用已加载的 BGE tokenizer 统计每段文本的真实 token 数。"""
+    if embedding_model is None:
+        raise HTTPException(status_code=503, detail="BGE 模型未就绪")
+    counts = await asyncio.to_thread(
+        lambda: [embedding_model.token_count(text) for text in request.texts]
+    )
+    return {"model": MODEL_NAME, "counts": counts}

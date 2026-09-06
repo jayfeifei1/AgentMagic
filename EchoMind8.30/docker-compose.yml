@@ -127,9 +127,11 @@ services:
       - MYSQL_PORT=3306
       - ECHOMIND_TRACE_UTC_OFFSET_HOURS=8
       - ECHOMIND_EMBEDDING_URL=http://embedding:8080/embed
+      - MINERU_RELAY_URL=${MINERU_RELAY_URL:-http://host.docker.internal:18789}
     volumes:
       - ./data/chroma:/app/data/chroma
       - ./data/eval:/app/data/eval
+      - ./data/knowledge:/app/data/knowledge
       - ./skills:/app/skills
       - ./logs:/app/logs
     depends_on:

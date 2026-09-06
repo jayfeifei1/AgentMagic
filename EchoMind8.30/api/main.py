@@ -527,7 +527,8 @@ async def add_knowledge(body: BatchDocInput):
     """
     批量导入文档到知识库。
 
-    文档会自动切片（每片 500 字），调用本地 BGE 服务生成向量后存入 ChromaDB。
+    文档会按 Markdown 标题层级切为 Section；仅超长 Section 才按段落、句子继续切分，
+    调用本地 BGE 服务生成向量后存入 ChromaDB。
 
     示例请求体：
     ```json
@@ -554,7 +555,8 @@ async def upload_knowledge(file: UploadFile = File(...)):
     上传文件导入知识库。
 
     支持格式：
-    - `.txt` / `.md`：整个文件作为一篇文档，文件名作为标题
+    - `.txt` / `.md`：本地读取并统一保存为 Markdown
+    - `.pdf` / `.docx` / 图片：调用 MinerU 轻量 API 解析为 Markdown
     - `.json`：JSON 数组格式 `[{"title": "...", "content": "..."}, ...]`
 
     文件大小限制：10MB
@@ -568,21 +570,67 @@ async def upload_knowledge(file: UploadFile = File(...)):
     if len(content) > 10 * 1024 * 1024:
         raise HTTPException(413, "文件大小超过 10MB 限制")
 
-    text = content.decode("utf-8", errors="ignore")
-    filename = file.filename or "unknown"
+    filename = pathlib.Path(file.filename or "unknown").name
+    suffix = pathlib.Path(filename).suffix.lower()
 
-    if filename.endswith(".json"):
+    if suffix == ".json":
         import json as _json
         try:
-            docs = _json.loads(text)
+            docs = _json.loads(content.decode("utf-8"))
             if not isinstance(docs, list):
                 raise HTTPException(400, "JSON 文件应为数组格式: [{title, content}, ...]")
-        except _json.JSONDecodeError as e:
+        except (UnicodeDecodeError, _json.JSONDecodeError) as e:
             raise HTTPException(400, f"JSON 解析失败: {e}")
     else:
-        # txt / md：整个文件作为一篇文档
-        title = filename.rsplit(".", 1)[0] if "." in filename else filename
-        docs = [{"title": title, "content": text}]
+        direct_extensions = {".txt", ".md"}
+        mineru_extensions = {
+            ".pdf", ".docx", ".png", ".jpg", ".jpeg", ".jp2", ".webp", ".gif", ".bmp",
+        }
+        if suffix not in direct_extensions | mineru_extensions:
+            raise HTTPException(
+                415,
+                "不支持的文件格式，仅支持 .txt、.md、.json、.pdf、.docx 和常见图片",
+            )
+
+        document_id = uuid.uuid4().hex
+        knowledge_dir = pathlib.Path(
+            os.getenv("ECHOMIND_KNOWLEDGE_DIR", str(pathlib.Path(_ROOT) / "data" / "knowledge"))
+        )
+        raw_dir = knowledge_dir / "raw" / document_id
+        parsed_dir = knowledge_dir / "parsed"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        parsed_dir.mkdir(parents=True, exist_ok=True)
+        (raw_dir / filename).write_bytes(content)
+
+        if suffix in direct_extensions:
+            text = content.decode("utf-8", errors="replace").strip()
+            parse_source = "native"
+        else:
+            from mcp.mineru_parser import MinerUParseError, MinerUParser
+
+            try:
+                text = await MinerUParser().parse(filename, content)
+            except MinerUParseError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            parse_source = "mineru"
+        if not text:
+            raise HTTPException(400, "文档内容为空，无法导入知识库")
+
+        parsed_path = parsed_dir / f"{document_id}.md"
+        parsed_path.write_text(text, encoding="utf-8")
+        title = pathlib.Path(filename).stem
+        docs = [{
+            "title": title,
+            "content": text,
+            "metadata": {
+                "source": "echomind_uploaded_document_v1",
+                "document_id": document_id,
+                "original_filename": filename,
+                "file_type": suffix.lstrip("."),
+                "parse_source": parse_source,
+                "source_file": str(parsed_path.relative_to(knowledge_dir)),
+            },
+        }]
 
     count = await kb.add_documents_async(docs)
     total = await kb.doc_count_async()
@@ -590,6 +638,8 @@ async def upload_knowledge(file: UploadFile = File(...)):
         "message": f"文件 {filename} 导入成功",
         "added_chunks": count,
         "total_chunks": total,
+        "document_id": docs[0].get("metadata", {}).get("document_id"),
+        "parse_source": docs[0].get("metadata", {}).get("parse_source", "native"),
     }
 
 

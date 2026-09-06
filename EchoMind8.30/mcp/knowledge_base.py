@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -33,12 +34,15 @@ class KnowledgeBase:
     """
 
     COLLECTION_NAME = "knowledge_base_bge_v1"
-    LEGACY_COLLECTION_NAME = "knowledge_base"
-    EMBEDDING_BATCH_SIZE = 64
     SEED_SOURCE = "echomind_default_seed_v1"
-    LEGACY_DEFAULT_TITLES = {
-        "退款政策", "订单查询", "账户安全", "技术故障排查", "会员与积分", "配送说明",
-    }
+    UPLOADED_SOURCE = "echomind_uploaded_document_v1"
+    TOKEN_TARGET = 384
+    TOKEN_LIMIT = 480
+    OVERLAP_TOKENS = 48
+    PARENT_CONTEXT_TOKENS = 80
+    _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+    _HTML_TABLE_RE = re.compile(r"<table\b.*?</table>", re.IGNORECASE | re.DOTALL)
+    _CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
 
     def __init__(
         self,
@@ -55,10 +59,16 @@ class KnowledgeBase:
         self._embedding_timeout_s = embedding_timeout_s or float(
             os.getenv("ECHOMIND_EMBEDDING_TIMEOUT_S", "5")
         )
+        self._token_count_url = self._embedding_url.rsplit("/", 1)[0] + "/token-count"
+        self._token_cache: Dict[str, int] = {}
         self._embedding_dimensions: Optional[int] = None
         self._embedding_model = ""
+        self._knowledge_dir = Path(os.getenv(
+            "ECHOMIND_KNOWLEDGE_DIR",
+            str(Path(__file__).resolve().parents[1] / "data" / "knowledge"),
+        ))
         self._seed_dir = Path(seed_dir) if seed_dir else (
-            Path(__file__).resolve().parents[1] / "data" / "knowledge" / "seed"
+            self._knowledge_dir / "seed"
         )
 
         # 优先连接独立 ChromaDB 服务，连不上才使用本地嵌入式模式。
@@ -87,13 +97,8 @@ class KnowledgeBase:
                 "embedding_model": "BAAI/bge-small-zh-v1.5",
             },
         )
-        try:
-            self._legacy_collection = self._client.get_collection(self.LEGACY_COLLECTION_NAME)
-        except Exception:
-            self._legacy_collection = None
-
     async def initialize(self) -> None:
-        """验证本地 BGE 服务，迁移自定义旧文档，并导入默认种子知识。"""
+        """验证本地 BGE 服务，并按 v2 分块规则重建持久化知识。"""
         await asyncio.to_thread(self._embed_texts, ["EchoMind RAG 向量服务健康检查"])
         logger.info(
             "RAG Embedding 已就绪: model=%s, dimensions=%s, collection=%s",
@@ -101,9 +106,8 @@ class KnowledgeBase:
             self._embedding_dimensions,
             self.COLLECTION_NAME,
         )
-        await self._migrate_legacy_documents()
-        await self._remove_legacy_default_documents()
         await self._load_seed_documents()
+        await self._load_persisted_documents()
 
     # ── 文档管理 ──────────────────────────────────────────────────────────────
 
@@ -111,8 +115,8 @@ class KnowledgeBase:
         """
         批量导入文档到知识库。
 
-        documents 格式: [{"title": "...", "content": "..."}, ...]
-        长文档会自动切片（每片 500 字）。
+        documents 格式: [{"title": "...", "content": "..."}, ...]。
+        文档按标题层级切为业务 Section，仅在超长 Section 内递归切分。
         """
         ids, docs, metas = [], [], []
 
@@ -122,16 +126,20 @@ class KnowledgeBase:
             extra_metadata = doc.get("metadata", {})
             if not isinstance(extra_metadata, dict):
                 extra_metadata = {}
-            chunks  = self._chunk_text(content, chunk_size=500)
+            chunks = self._chunk_document(title, content)
 
             for i, chunk in enumerate(chunks):
-                doc_id = hashlib.md5(f"{title}_{i}_{chunk[:50]}".encode()).hexdigest()
+                identity = str(extra_metadata.get("document_id") or title)
+                chunk_text = chunk["content"]
+                doc_id = hashlib.md5(f"{identity}_{i}_{chunk_text[:50]}".encode()).hexdigest()
                 ids.append(doc_id)
-                docs.append(chunk)
+                docs.append(chunk_text)
                 metas.append({
                     "title": title,
                     "chunk_index": i,
                     "total_chunks": len(chunks),
+                    "chunker_version": "hierarchical_v2",
+                    **chunk["metadata"],
                     **extra_metadata,
                 })
 
@@ -177,6 +185,7 @@ class KnowledgeBase:
                     "content":  doc,
                     "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
                     "chunk":    meta.get("chunk_index", 0),
+                    "section_path": meta.get("section_path", ""),
                 })
 
         return items
@@ -211,30 +220,275 @@ class KnowledgeBase:
 
     # ── 内部方法 ──────────────────────────────────────────────────────────────
 
-    def _chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
-        """将长文本按 chunk_size 切片，保留语义完整性（按句号/换行切分）。"""
-        if len(text) <= chunk_size:
-            return [text] if text.strip() else []
+    def _chunk_document(self, title: str, text: str) -> List[Dict[str, Any]]:
+        """按 Markdown 标题建立 Section，仅在过长 Section 内继续切分。"""
+        sections = self._parse_sections(title, text)
+        direct_text = {
+            tuple(section["path"]): self._limit_tokens("\n".join(section["lines"]))
+            for section in sections
+            if section["lines"]
+        }
+        chunks: List[Dict[str, Any]] = []
 
-        chunks = []
-        current = ""
-        # 按句子切分
-        sentences = text.replace("\n", "。").split("。")
-        for sent in sentences:
-            sent = sent.strip()
-            if not sent:
+        for section_index, section in enumerate(sections):
+            body = "\n".join(section["lines"]).strip()
+            if not body:
                 continue
-            if len(current) + len(sent) + 1 > chunk_size:
-                if current:
-                    chunks.append(current)
-                current = sent
-            else:
-                current = f"{current}。{sent}" if current else sent
-
-        if current:
-            chunks.append(current)
-
+            parent_intro = direct_text.get(tuple(section["path"][:-1]), "")
+            context = self._build_context(title, section["path"], parent_intro)
+            section_chunks = self._split_section(context, self._split_blocks(body))
+            for chunk_index, item in enumerate(section_chunks):
+                chunk_text = f"{context}\n{item['content']}"
+                chunks.append({
+                    "content": chunk_text,
+                    "metadata": {
+                        "section_path": " > ".join(section["path"]),
+                        "section_level": section["level"],
+                        "section_index": section_index,
+                        "chunk_index_in_section": chunk_index,
+                        "total_chunks_in_section": len(section_chunks),
+                        "content_type": item["content_type"],
+                        "token_count": self._count_tokens(chunk_text),
+                    },
+                })
         return chunks
+
+    def _parse_sections(self, title: str, text: str) -> List[Dict[str, Any]]:
+        """从 Markdown 标题恢复 Section；无标题文本归入文件标题下。"""
+        sections: List[Dict[str, Any]] = []
+        path: List[str] = []
+        current: Optional[Dict[str, Any]] = None
+
+        def flush() -> None:
+            if current is not None:
+                sections.append(current)
+
+        for line in text.replace("\r\n", "\n").split("\n"):
+            matched = self._HEADING_RE.match(line.strip())
+            if matched:
+                flush()
+                level = len(matched.group(1))
+                heading = matched.group(2).strip()
+                path = path[:level - 1]
+                path.append(heading)
+                current = {"path": path.copy(), "level": level, "lines": []}
+            else:
+                if current is None:
+                    current = {"path": [title or "未命名文档"], "level": 0, "lines": []}
+                current["lines"].append(line)
+        flush()
+        return sections
+
+    def _build_context(self, title: str, path: List[str], parent_intro: str) -> str:
+        parts = [f"文档：{title or path[0]}", f"章节：{' > '.join(path)}"]
+        if parent_intro:
+            parts.append(f"父级说明：{parent_intro}")
+        return "\n".join(parts) + "\n内容："
+
+    def _split_blocks(self, text: str) -> List[Dict[str, str]]:
+        """保留表格、代码和连续列表，普通正文按空行形成段落块。"""
+        blocks: List[Dict[str, str]] = []
+        pattern = re.compile(
+            f"({self._HTML_TABLE_RE.pattern}|{self._CODE_BLOCK_RE.pattern})",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for part in re.split(pattern, text):
+            stripped = part.strip()
+            if not stripped:
+                continue
+            if self._HTML_TABLE_RE.fullmatch(stripped):
+                blocks.append({"content": stripped, "content_type": "table"})
+                continue
+            if self._CODE_BLOCK_RE.fullmatch(stripped):
+                blocks.append({"content": stripped, "content_type": "code"})
+                continue
+            for paragraph in re.split(r"\n\s*\n", stripped):
+                paragraph = paragraph.strip()
+                if not paragraph:
+                    continue
+                lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
+                if len(lines) >= 2 and all(line.startswith("|") for line in lines):
+                    kind = "table"
+                elif lines and all(re.match(r"(?:[-*+]\s+|\d+[.)]\s+)", line) for line in lines):
+                    kind = "list"
+                else:
+                    kind = "text"
+                blocks.append({"content": "\n".join(lines), "content_type": kind})
+        return blocks
+
+    def _split_section(self, context: str, blocks: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """以 384 Token 为目标；表格始终独立，480 Token 是硬上限。"""
+        chunks: List[Dict[str, str]] = []
+        current: List[Dict[str, str]] = []
+
+        def flush() -> None:
+            nonlocal current
+            if current:
+                chunks.append({
+                    "content": self._join_blocks(current),
+                    "content_type": self._content_type(current),
+                })
+                current = []
+
+        for block in blocks:
+            # 表格不与叙述文字混装；超长表格按行拆并重复表头。
+            if block["content_type"] == "table":
+                flush()
+                chunks.extend(self._split_table(context, block["content"]))
+                continue
+
+            candidate = current + [block]
+            if current and self._count_tokens(self._with_context(context, candidate)) > self.TOKEN_TARGET:
+                previous = current
+                flush()
+                current = self._overlap_blocks(context, previous)
+
+            candidate = current + [block]
+            if self._count_tokens(self._with_context(context, candidate)) <= self.TOKEN_LIMIT:
+                current = candidate
+                continue
+
+            # 重叠本身与新块仍超过硬上限时，不写入一份只有重叠内容的重复块。
+            if current:
+                current = []
+            chunks.extend(self._split_oversized_block(context, block))
+        flush()
+        return chunks
+
+    def _split_oversized_block(self, context: str, block: Dict[str, str]) -> List[Dict[str, str]]:
+        units = self._split_block_units(block)
+        chunks: List[Dict[str, str]] = []
+        current: List[str] = []
+        for unit in units:
+            candidate = "\n".join(current + [unit])
+            if current and self._count_tokens(f"{context}\n{candidate}") > self.TOKEN_TARGET:
+                chunks.append({"content": "\n".join(current), "content_type": block["content_type"]})
+                current = self._overlap_units(context, current)
+            candidate_with_context = context + "\n" + "\n".join(current + [unit])
+            if self._count_tokens(candidate_with_context) <= self.TOKEN_LIMIT:
+                current.append(unit)
+            else:
+                current = []
+                chunks.extend(self._hard_split_unit(context, unit, block["content_type"]))
+        if current:
+            chunks.append({"content": "\n".join(current), "content_type": block["content_type"]})
+        return chunks
+
+    def _split_block_units(self, block: Dict[str, str]) -> List[str]:
+        content = block["content"]
+        if block["content_type"] in {"table", "list", "code"}:
+            return [line for line in content.splitlines() if line.strip()] or [content]
+        return [part.strip() for part in re.findall(r"[^。！？!?；;]+[。！？!?；;]?", content) if part.strip()] or [content]
+
+    def _split_table(self, context: str, table: str) -> List[Dict[str, str]]:
+        """表格独立成块；Markdown 表格超长时按行切分并保留表头。"""
+        if self._count_tokens(f"{context}\n{table}") <= self.TOKEN_LIMIT:
+            return [{"content": table, "content_type": "table"}]
+
+        lines = [line for line in table.splitlines() if line.strip()]
+        if len(lines) < 3 or not all(line.lstrip().startswith("|") for line in lines[:2]):
+            return self._split_oversized_block(context, {"content": table, "content_type": "table"})
+        header = "\n".join(lines[:2])
+        rows = lines[2:]
+        chunks: List[Dict[str, str]] = []
+        current: List[str] = []
+        for row in rows:
+            candidate = header + "\n" + "\n".join(current + [row])
+            if current and self._count_tokens(f"{context}\n{candidate}") > self.TOKEN_TARGET:
+                chunks.append({"content": header + "\n" + "\n".join(current), "content_type": "table"})
+                current = []
+            candidate = header + "\n" + "\n".join(current + [row])
+            if self._count_tokens(f"{context}\n{candidate}") <= self.TOKEN_LIMIT:
+                current.append(row)
+            else:
+                # 单行极长时退化为硬切，仍让表头进入每个切片。
+                for piece in self._hard_split_unit(context + "\n" + header, row, "table"):
+                    chunks.append({"content": header + "\n" + piece["content"], "content_type": "table"})
+        if current:
+            chunks.append({"content": header + "\n" + "\n".join(current), "content_type": "table"})
+        return chunks
+
+    def _hard_split_unit(self, context: str, unit: str, content_type: str) -> List[Dict[str, str]]:
+        pieces: List[Dict[str, str]] = []
+        current = ""
+        for char in unit:
+            candidate = current + char
+            if current and self._count_tokens(f"{context}\n{candidate}") > self.TOKEN_LIMIT:
+                pieces.append({"content": current, "content_type": content_type})
+                overlap = self._tail_text(current, self.OVERLAP_TOKENS)
+                current = overlap + char
+                if self._count_tokens(f"{context}\n{current}") > self.TOKEN_LIMIT:
+                    current = char
+            else:
+                current = candidate
+        if current:
+            pieces.append({"content": current, "content_type": content_type})
+        return pieces
+
+    def _tail_text(self, text: str, token_limit: int) -> str:
+        tail = ""
+        for char in reversed(text):
+            candidate = char + tail
+            if self._count_tokens(candidate) > token_limit:
+                break
+            tail = candidate
+        return tail
+
+    def _overlap_blocks(self, context: str, blocks: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        tail: List[Dict[str, str]] = []
+        for block in reversed(blocks):
+            candidate = [block] + tail
+            if self._count_tokens(self._with_context(context, candidate)) > self.OVERLAP_TOKENS + self._count_tokens(context):
+                break
+            tail = candidate
+        return tail
+
+    def _overlap_units(self, context: str, units: List[str]) -> List[str]:
+        tail: List[str] = []
+        for unit in reversed(units):
+            candidate = [unit] + tail
+            if self._count_tokens(f"{context}\n{'\n'.join(candidate)}") > self.OVERLAP_TOKENS + self._count_tokens(context):
+                break
+            tail = candidate
+        return tail
+
+    @staticmethod
+    def _join_blocks(blocks: List[Dict[str, str]]) -> str:
+        return "\n\n".join(block["content"] for block in blocks)
+
+    def _with_context(self, context: str, blocks: List[Dict[str, str]]) -> str:
+        return f"{context}\n{self._join_blocks(blocks)}"
+
+    @staticmethod
+    def _content_type(blocks: List[Dict[str, str]]) -> str:
+        kinds = {block["content_type"] for block in blocks}
+        return next(iter(kinds)) if len(kinds) == 1 else "mixed"
+
+    def _limit_tokens(self, text: str) -> str:
+        result = ""
+        for unit in self._split_block_units({"content": text, "content_type": "text"}):
+            if self._count_tokens(unit) > self.PARENT_CONTEXT_TOKENS:
+                break
+            candidate = f"{result}{unit}" if result else unit
+            if self._count_tokens(candidate) > self.PARENT_CONTEXT_TOKENS:
+                break
+            result = candidate
+        return result
+
+    def _count_tokens(self, text: str) -> int:
+        """复用 BGE 服务已加载的 tokenizer，避免字符数与模型输入预算不一致。"""
+        cleaned = str(text or "")
+        cached = self._token_cache.get(cleaned)
+        if cached is not None:
+            return cached
+        with httpx.Client(timeout=self._embedding_timeout_s) as client:
+            response = client.post(self._token_count_url, json={"texts": [cleaned]})
+            response.raise_for_status()
+            counts = response.json().get("counts")
+        if not isinstance(counts, list) or len(counts) != 1 or not isinstance(counts[0], int):
+            raise ValueError("Embedding 服务返回的 Token 数量不正确")
+        self._token_cache[cleaned] = counts[0]
+        return counts[0]
 
     def _read_seed_documents(self) -> List[Dict[str, Any]]:
         """读取版本受控的默认 Markdown 知识，不再将业务规则写死在 Python 中。"""
@@ -272,6 +526,49 @@ class KnowledgeBase:
         await self.add_documents_async(documents)
         logger.info("已从默认知识目录导入 %s 篇文档: %s", len(documents), self._seed_dir)
 
+    async def _load_persisted_documents(self) -> None:
+        """将已落盘的解析 Markdown 重建到 v2 Collection，原始文件仍只保留在 raw/。"""
+        parsed_dir = self._knowledge_dir / "parsed"
+        if not parsed_dir.exists():
+            return
+        existing = await asyncio.to_thread(
+            self._collection.get,
+            where={"source": self.UPLOADED_SOURCE},
+            include=["metadatas"],
+        )
+        indexed_ids = {
+            str(metadata.get("document_id"))
+            for metadata in existing.get("metadatas") or []
+            if isinstance(metadata, dict) and metadata.get("document_id")
+        }
+        documents: List[Dict[str, Any]] = []
+        for parsed_path in sorted(parsed_dir.glob("*.md")):
+            document_id = parsed_path.stem
+            if document_id in indexed_ids:
+                continue
+            content = parsed_path.read_text(encoding="utf-8").strip()
+            if not content:
+                continue
+            raw_dir = self._knowledge_dir / "raw" / document_id
+            original = next((path for path in raw_dir.iterdir() if path.is_file()), None) if raw_dir.exists() else None
+            filename = original.name if original else parsed_path.name
+            suffix = original.suffix.lower().lstrip(".") if original else "md"
+            documents.append({
+                "title": original.stem if original else parsed_path.stem,
+                "content": content,
+                "metadata": {
+                    "source": self.UPLOADED_SOURCE,
+                    "document_id": document_id,
+                    "original_filename": filename,
+                    "file_type": suffix,
+                    "parse_source": "native" if suffix in {"txt", "md"} else "mineru",
+                    "source_file": str(parsed_path.relative_to(self._knowledge_dir)),
+                },
+            })
+        if documents:
+            await self.add_documents_async(documents)
+            logger.info("已按 v2 切片规则重建 %s 篇已解析文档", len(documents))
+
     def _embed_texts(self, texts: List[str]) -> List[List[float]]:
         """调用本地 BGE 服务，并校验向量数量与维度。"""
         cleaned = [str(text or "").encode("utf-8", errors="ignore").decode("utf-8") for text in texts]
@@ -298,66 +595,3 @@ class KnowledgeBase:
         self._embedding_dimensions = dimensions
         self._embedding_model = str(payload.get("model") or self._embedding_model)
         return normalized
-
-    async def _migrate_legacy_documents(self) -> None:
-        """将旧 MiniLM Collection 的原文档重新编码为 BGE 向量，写入新 Collection。"""
-        if self._legacy_collection is None:
-            return
-        legacy_count = await asyncio.to_thread(self._legacy_collection.count)
-        if legacy_count == 0:
-            return
-        legacy = await asyncio.to_thread(
-            self._legacy_collection.get,
-            include=["documents", "metadatas"],
-        )
-        entries = [
-            (doc_id, document, metadata if isinstance(metadata, dict) else {})
-            for doc_id, document, metadata in zip(
-                legacy.get("ids") or [],
-                legacy.get("documents") or [],
-                legacy.get("metadatas") or [],
-            )
-            if (
-                isinstance(doc_id, str)
-                and isinstance(document, str)
-                and document.strip()
-                and (
-                    not isinstance(metadata, dict)
-                    or metadata.get("title") not in self.LEGACY_DEFAULT_TITLES
-                )
-            )
-        ]
-        if not entries:
-            return
-
-        existing = await asyncio.to_thread(
-            self._collection.get,
-            ids=[entry[0] for entry in entries],
-        )
-        existing_ids = set(existing.get("ids") or [])
-        pending = [entry for entry in entries if entry[0] not in existing_ids]
-        for start in range(0, len(pending), self.EMBEDDING_BATCH_SIZE):
-            batch = pending[start:start + self.EMBEDDING_BATCH_SIZE]
-            vectors = await asyncio.to_thread(self._embed_texts, [entry[1] for entry in batch])
-            await asyncio.to_thread(
-                self._collection.add,
-                ids=[entry[0] for entry in batch],
-                documents=[entry[1] for entry in batch],
-                embeddings=vectors,
-                metadatas=[entry[2] for entry in batch],
-            )
-        if pending:
-            logger.info("已迁移 %s 个旧知识库片段到 %s", len(pending), self.COLLECTION_NAME)
-
-    async def _remove_legacy_default_documents(self) -> None:
-        """移除曾由 Python 写死的六篇演示文档，避免与新的 Markdown 种子重复。"""
-        existing = await asyncio.to_thread(self._collection.get, include=["metadatas"])
-        legacy_ids = [
-            doc_id
-            for doc_id, metadata in zip(existing.get("ids") or [], existing.get("metadatas") or [])
-            if isinstance(metadata, dict)
-            and metadata.get("title") in self.LEGACY_DEFAULT_TITLES
-        ]
-        if legacy_ids:
-            await asyncio.to_thread(self._collection.delete, ids=legacy_ids)
-            logger.info("已移除 %s 个旧默认知识片段", len(legacy_ids))
