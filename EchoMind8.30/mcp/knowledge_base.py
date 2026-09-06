@@ -12,6 +12,7 @@ ChromaDB 在这里的角色：
   两者是不同的 collection，互不干扰。
 """
 import asyncio
+import html
 import hashlib
 import logging
 import os
@@ -98,7 +99,7 @@ class KnowledgeBase:
             },
         )
     async def initialize(self) -> None:
-        """验证本地 BGE 服务，并按 v2 分块规则重建持久化知识。"""
+        """验证本地 BGE 服务，并同步默认知识与已解析文档。"""
         await asyncio.to_thread(self._embed_texts, ["EchoMind RAG 向量服务健康检查"])
         logger.info(
             "RAG Embedding 已就绪: model=%s, dimensions=%s, collection=%s",
@@ -123,9 +124,12 @@ class KnowledgeBase:
         for doc in documents:
             title = doc.get("title", "")
             content = doc.get("content", "")
-            extra_metadata = doc.get("metadata", {})
-            if not isinstance(extra_metadata, dict):
-                extra_metadata = {}
+            raw_metadata = doc.get("metadata", {})
+            extra_metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+            extra_metadata.setdefault(
+                "content_hash",
+                hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            )
             chunks = self._chunk_document(title, content)
 
             for i, chunk in enumerate(chunks):
@@ -138,7 +142,7 @@ class KnowledgeBase:
                     "title": title,
                     "chunk_index": i,
                     "total_chunks": len(chunks),
-                    "chunker_version": "hierarchical_v2",
+                    "chunker_version": "hierarchical_v1",
                     **chunk["metadata"],
                     **extra_metadata,
                 })
@@ -186,6 +190,8 @@ class KnowledgeBase:
                     "score":    round(1.0 - dist, 4),  # ChromaDB 返回距离，转为相似度
                     "chunk":    meta.get("chunk_index", 0),
                     "section_path": meta.get("section_path", ""),
+                    "document_id": meta.get("document_id", ""),
+                    "source_file": meta.get("source_file", ""),
                 })
 
         return items
@@ -381,31 +387,59 @@ class KnowledgeBase:
         return [part.strip() for part in re.findall(r"[^。！？!?；;]+[。！？!?；;]?", content) if part.strip()] or [content]
 
     def _split_table(self, context: str, table: str) -> List[Dict[str, str]]:
-        """表格独立成块；Markdown 表格超长时按行切分并保留表头。"""
+        """表格独立成块；Markdown/HTML 表格超长时按行切分并保留表头。"""
         if self._count_tokens(f"{context}\n{table}") <= self.TOKEN_LIMIT:
             return [{"content": table, "content_type": "table"}]
 
         lines = [line for line in table.splitlines() if line.strip()]
-        if len(lines) < 3 or not all(line.lstrip().startswith("|") for line in lines[:2]):
-            return self._split_oversized_block(context, {"content": table, "content_type": "table"})
-        header = "\n".join(lines[:2])
-        rows = lines[2:]
+        if len(lines) >= 3 and all(line.lstrip().startswith("|") for line in lines[:2]):
+            header = "\n".join(lines[:2])
+            rows = lines[2:]
+            return self._pack_table_rows(
+                context,
+                rows,
+                lambda selected: header + "\n" + "\n".join(selected),
+            )
+
+        html_rows = re.findall(r"<tr\b.*?</tr>", table, re.IGNORECASE | re.DOTALL)
+        if len(html_rows) >= 2:
+            opening = re.search(r"<table\b[^>]*>", table, re.IGNORECASE)
+            table_open = opening.group(0) if opening else "<table>"
+            header = html_rows[0]
+            return self._pack_table_rows(
+                context,
+                html_rows[1:],
+                lambda selected: table_open + header + "".join(selected) + "</table>",
+            )
+
+        return self._split_oversized_block(context, {"content": table, "content_type": "table"})
+
+    def _pack_table_rows(
+        self,
+        context: str,
+        rows: List[str],
+        render: Any,
+    ) -> List[Dict[str, str]]:
+        """按 Token 预算装入表格行，render 负责为每块重复表头。"""
         chunks: List[Dict[str, str]] = []
         current: List[str] = []
         for row in rows:
-            candidate = header + "\n" + "\n".join(current + [row])
+            candidate = render(current + [row])
             if current and self._count_tokens(f"{context}\n{candidate}") > self.TOKEN_TARGET:
-                chunks.append({"content": header + "\n" + "\n".join(current), "content_type": "table"})
+                chunks.append({"content": render(current), "content_type": "table"})
                 current = []
-            candidate = header + "\n" + "\n".join(current + [row])
+            candidate = render(current + [row])
             if self._count_tokens(f"{context}\n{candidate}") <= self.TOKEN_LIMIT:
                 current.append(row)
             else:
-                # 单行极长时退化为硬切，仍让表头进入每个切片。
-                for piece in self._hard_split_unit(context + "\n" + header, row, "table"):
-                    chunks.append({"content": header + "\n" + piece["content"], "content_type": "table"})
+                # 极端超长单行转为文本片段再装回单元格，保持表头与 HTML 完整。
+                row_text = re.sub(r"<[^>]+>", " ", row)
+                row_text = re.sub(r"\s+", " ", row_text).strip()
+                for piece in self._hard_split_unit(context, row_text, "table"):
+                    safe_row = f"<tr><td>{html.escape(piece['content'])}</td></tr>"
+                    chunks.append({"content": render([safe_row]), "content_type": "table"})
         if current:
-            chunks.append({"content": header + "\n" + "\n".join(current), "content_type": "table"})
+            chunks.append({"content": render(current), "content_type": "table"})
         return chunks
 
     def _hard_split_unit(self, context: str, unit: str, content_type: str) -> List[Dict[str, str]]:
@@ -507,27 +541,50 @@ class KnowledgeBase:
             documents.append({
                 "title": title,
                 "content": content,
-                "metadata": {"source": self.SEED_SOURCE, "source_file": path.name},
+                "metadata": {
+                    "source": self.SEED_SOURCE,
+                    "source_file": path.name,
+                    "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                },
             })
         return documents
 
     async def _load_seed_documents(self) -> None:
-        """首次加载 data/knowledge/seed 下的默认知识。"""
+        """按内容哈希同步 data/knowledge/seed，文件修改后替换旧分片。"""
+        documents = self._read_seed_documents()
         existing = await asyncio.to_thread(
             self._collection.get,
             where={"source": self.SEED_SOURCE},
             include=["metadatas"],
         )
-        if existing.get("ids"):
-            return
-        documents = self._read_seed_documents()
-        if not documents:
-            return
-        await self.add_documents_async(documents)
-        logger.info("已从默认知识目录导入 %s 篇文档: %s", len(documents), self._seed_dir)
+        entries: Dict[str, List[tuple]] = {}
+        for doc_id, metadata in zip(existing.get("ids") or [], existing.get("metadatas") or []):
+            if isinstance(metadata, dict):
+                entries.setdefault(str(metadata.get("source_file", "")), []).append((doc_id, metadata))
+
+        active_files = {str(doc["metadata"]["source_file"]) for doc in documents}
+        stale_ids = [
+            doc_id
+            for source_file, items in entries.items()
+            if source_file not in active_files
+            for doc_id, _ in items
+        ]
+        pending = []
+        for document in documents:
+            metadata = document["metadata"]
+            current = entries.get(str(metadata["source_file"]), [])
+            if current and all(item[1].get("content_hash") == metadata["content_hash"] for item in current):
+                continue
+            stale_ids.extend(item[0] for item in current)
+            pending.append(document)
+        if stale_ids:
+            await asyncio.to_thread(self._collection.delete, ids=list(dict.fromkeys(stale_ids)))
+        if pending:
+            await self.add_documents_async(pending)
+            logger.info("已同步 %s 篇默认知识: %s", len(pending), self._seed_dir)
 
     async def _load_persisted_documents(self) -> None:
-        """将已落盘的解析 Markdown 重建到 v2 Collection，原始文件仍只保留在 raw/。"""
+        """按内容哈希同步已落盘 Markdown；原始文件仍保留在 raw/。"""
         parsed_dir = self._knowledge_dir / "parsed"
         if not parsed_dir.exists():
             return
@@ -536,19 +593,24 @@ class KnowledgeBase:
             where={"source": self.UPLOADED_SOURCE},
             include=["metadatas"],
         )
-        indexed_ids = {
-            str(metadata.get("document_id"))
-            for metadata in existing.get("metadatas") or []
-            if isinstance(metadata, dict) and metadata.get("document_id")
-        }
+        entries: Dict[str, List[tuple]] = {}
+        for doc_id, metadata in zip(existing.get("ids") or [], existing.get("metadatas") or []):
+            if isinstance(metadata, dict) and metadata.get("document_id"):
+                entries.setdefault(str(metadata["document_id"]), []).append((doc_id, metadata))
         documents: List[Dict[str, Any]] = []
+        active_ids = set()
+        stale_ids: List[str] = []
         for parsed_path in sorted(parsed_dir.glob("*.md")):
             document_id = parsed_path.stem
-            if document_id in indexed_ids:
-                continue
+            active_ids.add(document_id)
             content = parsed_path.read_text(encoding="utf-8").strip()
             if not content:
                 continue
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            current = entries.get(document_id, [])
+            if current and all(item[1].get("content_hash") == content_hash for item in current):
+                continue
+            stale_ids.extend(item[0] for item in current)
             raw_dir = self._knowledge_dir / "raw" / document_id
             original = next((path for path in raw_dir.iterdir() if path.is_file()), None) if raw_dir.exists() else None
             filename = original.name if original else parsed_path.name
@@ -563,11 +625,20 @@ class KnowledgeBase:
                     "file_type": suffix,
                     "parse_source": "native" if suffix in {"txt", "md"} else "mineru",
                     "source_file": str(parsed_path.relative_to(self._knowledge_dir)),
+                    "content_hash": content_hash,
                 },
             })
+        stale_ids.extend(
+            doc_id
+            for document_id, items in entries.items()
+            if document_id not in active_ids
+            for doc_id, _ in items
+        )
+        if stale_ids:
+            await asyncio.to_thread(self._collection.delete, ids=list(dict.fromkeys(stale_ids)))
         if documents:
             await self.add_documents_async(documents)
-            logger.info("已按 v2 切片规则重建 %s 篇已解析文档", len(documents))
+            logger.info("已同步 %s 篇已解析文档", len(documents))
 
     def _embed_texts(self, texts: List[str]) -> List[List[float]]:
         """调用本地 BGE 服务，并校验向量数量与维度。"""

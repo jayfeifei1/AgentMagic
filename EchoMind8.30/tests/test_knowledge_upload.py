@@ -25,6 +25,10 @@ class FakeKnowledgeBase:
 class FakeToolManager:
     def __init__(self, knowledge_base):
         self._tools = {"knowledge_search": type("Tool", (), {"handler": knowledge_base.search_handler})()}
+        self.cleared = []
+
+    def clear_cache(self, tool_name=None):
+        self.cleared.append(tool_name)
 
 
 class FakeMinerUParser:
@@ -52,6 +56,7 @@ def test_pdf_upload_stores_raw_and_markdown_then_imports(monkeypatch, tmp_path):
     assert (knowledge_dir / "parsed" / f"{document_id}.md").read_text(encoding="utf-8").startswith("# 物流")
     assert kb.documents[0]["metadata"]["source_file"] == f"parsed/{document_id}.md"
     assert kb.documents[0]["metadata"]["file_type"] == "pdf"
+    assert main._tool_manager.cleared == ["knowledge_search"]
 
 
 def test_txt_upload_reads_locally_without_mineru(monkeypatch, tmp_path):

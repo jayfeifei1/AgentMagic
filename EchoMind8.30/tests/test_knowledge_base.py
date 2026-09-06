@@ -1,3 +1,5 @@
+import asyncio
+import hashlib
 from pathlib import Path
 
 from mcp.knowledge_base import KnowledgeBase
@@ -26,6 +28,10 @@ class FakeCollection:
 
     def count(self):
         return len(self.documents)
+
+    def delete(self, ids):
+        for doc_id in ids:
+            self.documents.pop(doc_id, None)
 
     def get(self, ids=None, include=None, where=None):
         ids = ids or list(self.documents)
@@ -112,6 +118,23 @@ def test_table_is_stored_as_a_separate_chunk():
     assert "退款规则如下。" not in table_chunks[0]["content"]
 
 
+def test_long_html_table_repeats_header_in_each_chunk():
+    kb = make_knowledge_base(FakeCollection())
+    kb.TOKEN_TARGET = 150
+    kb.TOKEN_LIMIT = 180
+    header = "<tr><th>处理阶段</th><th>时效</th></tr>"
+    rows = "".join(
+        f"<tr><td>阶段{i}</td><td>{'说明' * 12}</td></tr>"
+        for i in range(8)
+    )
+    chunks = kb._chunk_document("退款时效", f"# 退款时效\n\n<table>{header}{rows}</table>")
+
+    assert len(chunks) > 1
+    assert all(chunk["metadata"]["content_type"] == "table" for chunk in chunks)
+    assert all(header in chunk["content"] for chunk in chunks)
+    assert all(chunk["metadata"]["token_count"] <= kb.TOKEN_LIMIT for chunk in chunks)
+
+
 def test_seed_markdown_is_read_with_title_and_source_metadata(tmp_path):
     seed_dir = tmp_path / "seed"
     seed_dir.mkdir()
@@ -128,5 +151,26 @@ def test_seed_markdown_is_read_with_title_and_source_metadata(tmp_path):
         "metadata": {
             "source": KnowledgeBase.SEED_SOURCE,
             "source_file": "01_refund.md",
+            "content_hash": hashlib.sha256("# 退款与售后\n\n退款规则正文。".encode()).hexdigest(),
         },
     }]
+
+
+def test_changed_seed_document_replaces_old_chunks(tmp_path):
+    seed_dir = tmp_path / "seed"
+    seed_dir.mkdir()
+    path = seed_dir / "01_refund.md"
+    path.write_text("# 退款政策\n\n新规则。", encoding="utf-8")
+    old_meta = {
+        "source": KnowledgeBase.SEED_SOURCE,
+        "source_file": path.name,
+        "content_hash": "old-hash",
+    }
+    collection = FakeCollection({"old-id": ("旧规则。", old_meta)})
+    kb = make_knowledge_base(collection)
+    kb._seed_dir = Path(seed_dir)
+
+    asyncio.run(kb._load_seed_documents())
+
+    assert "old-id" not in collection.documents
+    assert any("新规则。" in document for document, _ in collection.documents.values())

@@ -545,6 +545,7 @@ async def add_knowledge(body: BatchDocInput):
         raise HTTPException(503, "知识库未初始化")
     kb = tool.handler.__self__
     count = await kb.add_documents_async([{"title": d.title, "content": d.content} for d in body.documents])
+    _tool_manager.clear_cache("knowledge_search")
     total = await kb.doc_count_async()
     return {"message": f"成功导入 {count} 个文档片段", "added_chunks": count, "total_chunks": total}
 
@@ -633,6 +634,7 @@ async def upload_knowledge(file: UploadFile = File(...)):
         }]
 
     count = await kb.add_documents_async(docs)
+    _tool_manager.clear_cache("knowledge_search")
     total = await kb.doc_count_async()
     return {
         "message": f"文件 {filename} 导入成功",
