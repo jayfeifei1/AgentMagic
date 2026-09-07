@@ -21,6 +21,7 @@ class FakeCollection:
     def query(self, **kwargs):
         self.query_calls.append(kwargs)
         return {
+            "ids": [["refund-chunk-0"]],
             "documents": [["退款审核通过后原路退回"]],
             "metadatas": [[{"title": "退款政策", "chunk_index": 0}]],
             "distances": [[0.2]],
@@ -71,6 +72,7 @@ def test_knowledge_base_passes_bge_vectors_for_document_and_query():
     assert collection.query_calls[0]["query_embeddings"] == [[0.1, 0.2, 0.3]]
     assert "query_texts" not in collection.query_calls[0]
     assert results[0]["title"] == "退款政策"
+    assert results[0]["chunk_id"] == "refund-chunk-0"
 
 
 def test_hierarchical_chunk_keeps_path_and_parent_intro():

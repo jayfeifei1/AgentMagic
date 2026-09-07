@@ -73,6 +73,35 @@ def test_rerank_failure_reports_false_and_full_pipeline_cache_is_used():
     assert manager._client.messages.calls == calls_after_first
 
 
+def test_multi_query_recall_deduplicates_by_chroma_chunk_id():
+    async def handler(params, context):
+        score = 0.9 if params["query"] == "退款时效" else 0.7
+        return [{
+            "chunk_id": "chroma-refund-001",
+            "title": "退款政策",
+            "section_path": "退款审核",
+            "content": "退款审核完成后将按原路退回。",
+            "score": score,
+        }]
+
+    manager = make_manager(['["退款时效"]'])
+    manager.register(Tool(
+        name="knowledge_search",
+        description="test",
+        handler=handler,
+        schema={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+        cache_ttl=300,
+        supports_rerank=True,
+    ))
+
+    result = asyncio.run(manager.search_with_rewrite("knowledge_search", "退款多久到账", top_k=1))
+
+    assert result.success is True
+    assert len(result.data) == 1
+    assert result.data[0]["chunk_id"] == "chroma-refund-001"
+    assert result.data[0]["score"] == 0.9
+
+
 def test_clear_cache_removes_raw_and_pipeline_entries_for_tool():
     manager = make_manager([])
     manager._cache = {

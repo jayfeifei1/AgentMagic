@@ -368,8 +368,10 @@ class MCPToolManager:
         for r in results:
             if isinstance(r, ToolResult) and r.success and isinstance(r.data, list):
                 for item in r.data:
+                    chunk_id = ""
                     if isinstance(item, dict):
-                        identity = "|".join([
+                        chunk_id = str(item.get("chunk_id", "")).strip()
+                        identity = chunk_id or "|".join([
                             str(item.get("document_id") or item.get("source_file") or item.get("title", "")),
                             str(item.get("chunk", "")),
                             str(item.get("section_path", "")),
@@ -377,7 +379,7 @@ class MCPToolManager:
                         ])
                     else:
                         identity = str(item)
-                    key = hashlib.md5(identity.encode()).hexdigest()
+                    key = f"chunk:{identity}" if chunk_id else hashlib.md5(identity.encode()).hexdigest()
                     previous = merged_by_key.get(key)
                     if previous is None or (
                         isinstance(item, dict)
