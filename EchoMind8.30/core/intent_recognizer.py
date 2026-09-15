@@ -251,6 +251,9 @@ class IntentRecognizer:
 如果用户问题能匹配细粒度业务意图，请优先返回细粒度意图，而不是宽泛大类。
 例如退款优先返回 refund，发票优先返回 invoice，登录故障优先返回 technical_login。
 
+分类示例:
+{examples}
+
         {ctx}
         用户消息: "{message}"
 
