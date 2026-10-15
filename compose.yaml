@@ -1,0 +1,6 @@
+name: echomind830
+
+include:
+  - path: ./backend/docker-compose.yml
+    env_file: ./backend/.env
+  - path: ./frontend/docker-compose.yml

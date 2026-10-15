@@ -1,3 +1,5 @@
+name: echomindfrontend830
+
 services:
   echomind-frontend:
     build:

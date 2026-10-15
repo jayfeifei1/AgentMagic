@@ -5,14 +5,14 @@
 ## 1. 启动前准备
 
 1. 打开 Docker Desktop，确认状态为 Running。
-2. 确认后端配置文件 `EchoMind8.30/.env` 与 `EchoMind8.30/mysql.env` 已存在；不要在终端或截图中展示密钥。
+2. 确认后端配置文件 `backend/.env` 与 `backend/mysql.env` 已存在；不要在终端或截图中展示密钥。
 
 ## 2. 启动 MinerU Relay
 
 Relay 运行在 Windows 宿主机，负责下载 MinerU 的解析 Markdown，避免 Docker 访问 MinerU CDN 时出现 TLS EOF。
 
 ```powershell
-cd D:\PycharmProjects\EchoMind8.30\EchoMind8.30
+cd D:\PycharmProjects\EchoMind8.30\backend
 powershell -ExecutionPolicy Bypass -File .\tools\start_mineru_relay.ps1
 ```
 
@@ -31,7 +31,7 @@ MinerU Relay started (PID: ...): http://127.0.0.1:18789/health
 ## 3. 启动后端服务
 
 ```powershell
-cd D:\PycharmProjects\EchoMind8.30\EchoMind8.30
+cd D:\PycharmProjects\EchoMind8.30\backend
 docker compose up -d --build
 docker compose ps
 ```
@@ -51,7 +51,7 @@ docker compose ps
 ## 4. 启动前端服务
 
 ```powershell
-cd D:\PycharmProjects\EchoMind8.30\EchoMindFrontend8.30
+cd D:\PycharmProjects\EchoMind8.30\frontend
 docker compose up -d --build
 docker compose ps
 ```
@@ -72,10 +72,10 @@ docker compose ps
 仅重启 Docker 服务时，Relay 无需重启：
 
 ```powershell
-cd D:\PycharmProjects\EchoMind8.30\EchoMind8.30
+cd D:\PycharmProjects\EchoMind8.30\backend
 docker compose restart
 
-cd D:\PycharmProjects\EchoMind8.30\EchoMindFrontend8.30
+cd D:\PycharmProjects\EchoMind8.30\frontend
 docker compose restart
 ```
 
@@ -84,10 +84,10 @@ Windows 重启后，从第 2 节重新执行即可。
 ## 6. 查看日志
 
 ```powershell
-cd D:\PycharmProjects\EchoMind8.30\EchoMind8.30
+cd D:\PycharmProjects\EchoMind8.30\backend
 docker compose logs --tail 100 echomind nginx
 
-cd D:\PycharmProjects\EchoMind8.30\EchoMindFrontend8.30
+cd D:\PycharmProjects\EchoMind8.30\frontend
 docker compose logs --tail 100 echomind-frontend
 ```
 
@@ -96,10 +96,10 @@ docker compose logs --tail 100 echomind-frontend
 停止 Docker 服务但保留 MySQL、Redis 和 ChromaDB 数据：
 
 ```powershell
-cd D:\PycharmProjects\EchoMind8.30\EchoMindFrontend8.30
+cd D:\PycharmProjects\EchoMind8.30\frontend
 docker compose down
 
-cd D:\PycharmProjects\EchoMind8.30\EchoMind8.30
+cd D:\PycharmProjects\EchoMind8.30\backend
 docker compose down
 ```
 
@@ -116,3 +116,13 @@ Stop-Process -Id <PID>
 ```
 
 不要使用 `docker compose down -v`，否则会删除本地数据库、缓存和向量数据。
+
+## 根目录一键部署
+
+在仓库根目录执行 `docker compose up -d --build --wait --wait-timeout 600`，统一启动 `backend/` 与 `frontend/`。前端静态文件在 Docker 内构建，无需宿主机预先运行 npm。
+
+## 目录改名后的部署
+
+后端目录为 `backend/`，前端目录为 `frontend/`；仓库根目录不变，仍在根目录执行上述 `docker compose` 命令。后端和前端的 Compose 项目名固定为改名前的 `echomind830`、`echomindfrontend830`，以沿用已有镜像、网络和数据卷。环境配置与本地数据随目录一起移动。
+
+拉取此次更新前，已有部署需把旧后端目录内未纳入 Git 的 `.env`、`mysql.env`、`data/`、`logs/` 以及前端 `.env`（如有）迁移至对应新目录；不要覆盖新版本已跟踪的文件。运行中的容器需要在迁移后执行 `docker compose up -d --build --force-recreate --wait --wait-timeout 600`，以更新宿主机挂载路径；不要删除持久化数据卷。

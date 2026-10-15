@@ -5,7 +5,7 @@
 项目目录：
 
 ```text
-/Users/xiao_xiong/Desktop/code/EchoMindFrontend
+frontend/
 ```
 
 ## 功能
@@ -57,13 +57,7 @@ npm run dev
 
 ## Docker 部署
 
-先构建前端静态文件：
-
-```bash
-npm run build
-```
-
-再构建并启动容器：
+在 `frontend/` 目录构建并启动容器，Docker 会自动安装依赖并构建静态文件：
 
 ```bash
 docker compose up -d --build

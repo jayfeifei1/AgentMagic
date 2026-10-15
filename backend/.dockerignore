@@ -16,6 +16,7 @@ logs/
 .env
 .env.*
 !.env.example
+mysql.env
 
 data/chroma/
 data/**/*.sqlite3

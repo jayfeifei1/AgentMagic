@@ -5,4 +5,4 @@
 Thumbs.db
 
 # Workspace-local database credentials
-EchoMind8.30/mysql.env
+backend/mysql.env
