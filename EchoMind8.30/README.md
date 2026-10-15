@@ -1,21 +1,11 @@
-# EchoMind
-
-EchoMind 是一个面向客服/运营场景的多 Agent 智能系统。它不是单纯的聊天机器人，而是把以下能力串成闭环：
+面向客服/运营场景的多 Agent 智能系统。它不是单纯的聊天机器人，而是把以下能力串成闭环：
 
 - 细粒度意图识别
 - 路由驱动的多 Agent 编排
 - 意图驱动 RAG 检索
 - Redis + ChromaDB 分层记忆
 - 动态 Skills 注入
-- 在线监控与路由降权
 - LLM-as-Judge 端到端评测
-
-## 你可以先看什么
-
-- [技术亮点](wiki/技术亮点.md)
-- [重点代码](wiki/重点代码.md)
-- [业务流程说明](wiki/业务流程说明.md)
-- [完整使用指南](wiki/完整使用指南.md)
 
 ## 快速开始
 
@@ -44,8 +34,8 @@ cp .env.example .env
 最少确认这些变量可用：
 
 ```env
-ANTHROPIC_API_KEY=your_api_key
-REDIS_PASSWORD=echomind123
+ANTHROPIC_API_KEY=
+REDIS_PASSWORD=
 ```
 
 ### 3. 启动服务
@@ -99,10 +89,6 @@ docker compose logs -f echomind
 - `GET /skills`
 - `POST /skills/reload`
 
-### 监控与评测
-
-- `GET /monitor`
-- `POST /eval/run`
 
 ## 项目结构
 
@@ -157,12 +143,6 @@ data/                       持久化数据
 4. /monitor
 5. /eval/run
 ```
-
-如果你只想看项目怎么工作，直接读：
-
-- [EchoMind定位与技术亮点](wiki/EchoMind定位与技术亮点.md)
-- [技术亮点](wiki/技术亮点.md)
-- [重点代码](wiki/重点代码.md)
 
 ## 一句话概括
 
